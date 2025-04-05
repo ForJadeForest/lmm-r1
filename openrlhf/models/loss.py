@@ -73,8 +73,24 @@ class PolicyLoss(nn.Module):
         surr1 = ratio * advantages
         surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps) * advantages
         loss = -torch.min(surr1, surr2)
+        
+        # Calculate which samples were clipped
+        clipped_high = (ratio > 1 + self.clip_eps).float()
+        clipped_low = (ratio < 1 - self.clip_eps).float()
+        
+        if action_mask is not None:
+            # Mask samples for accurate counting
+            clipped_high = clipped_high * action_mask
+            clipped_low = clipped_low * action_mask
+            
+        clipped_high_count = clipped_high.sum()
+        clipped_low_count = clipped_low.sum()
+        total_count = action_mask.sum() if action_mask is not None else torch.prod(torch.tensor(ratio.shape))
+        
+        # Original loss calculation
         loss = masked_mean(loss, action_mask, dim=-1).mean()
-        return loss
+        
+        return loss, clipped_high_count, clipped_low_count, total_count
 
 
 class ValueLoss(nn.Module):

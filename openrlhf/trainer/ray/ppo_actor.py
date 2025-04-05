@@ -423,12 +423,15 @@ class ActorPPOTrainer(BasePPOTrainer):
             )
 
         # loss function
-        actor_loss = self.actor_loss_fn(
+        actor_loss_results = self.actor_loss_fn(
             action_log_probs,
             old_action_log_probs,
             advantages,
             action_mask=experience.action_mask,
         )
+        # Unpack the return values
+        actor_loss, clipped_high_count, clipped_low_count, total_count = actor_loss_results
+        
 
         if self.args.use_kl_loss:
             if self.initial_model is not None:
@@ -492,7 +495,14 @@ class ActorPPOTrainer(BasePPOTrainer):
             self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cuda")
 
         # status
-        status = {"policy_loss": actor_loss.item(), "actor_lr": self.actor_scheduler.get_last_lr()[0]}
+        status = {
+            "policy_loss": actor_loss.item(), 
+            "actor_lr": self.actor_scheduler.get_last_lr()[0],
+            "clipped_high_count": clipped_high_count.item(),
+            "clipped_low_count": clipped_low_count.item(),
+            "clipped_high_ratio": (clipped_high_count / total_count).item() if total_count > 0 else 0.0,
+            "clipped_low_ratio": (clipped_low_count / total_count).item() if total_count > 0 else 0.0,
+        }
         if self.pretrain_dataloader is not None:
             status["ptx_loss"] = ptx_loss.item()
         for k, v in experience.info.items():
