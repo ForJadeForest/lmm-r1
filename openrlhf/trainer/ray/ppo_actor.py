@@ -503,6 +503,11 @@ class ActorPPOTrainer(BasePPOTrainer):
             "clipped_high_ratio": (clipped_high_count / total_count).item() if total_count > 0 else 0.0,
             "clipped_low_ratio": (clipped_low_count / total_count).item() if total_count > 0 else 0.0,
         }
+        # Calculate the Entropy of the action logits. Use action_log_probs to compute entropy: H = -Σ p(x) * log p(x)
+        # where p(x) = exp(action_log_probs)
+        entropy = -(action_log_probs.exp() * action_log_probs).sum(dim=-1).mean()
+        status["entropy"] = entropy.item()
+
         if self.pretrain_dataloader is not None:
             status["ptx_loss"] = ptx_loss.item()
         for k, v in experience.info.items():
