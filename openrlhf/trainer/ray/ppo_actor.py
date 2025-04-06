@@ -74,8 +74,8 @@ class ActorPPOTrainer(BasePPOTrainer):
             wandb.define_metric("eval/epoch")
             wandb.define_metric("eval/*", step_metric="eval/epoch", step_sync=True)
 
-        # Initialize TensorBoard writer if wandb is not available
-        if self.strategy.args.use_tensorboard and self._wandb is None and self.strategy.is_rank_0():
+        # Initialize TensorBoard writer
+        if self.strategy.args.use_tensorboard and self.strategy.is_rank_0():
             from torch.utils.tensorboard import SummaryWriter
 
             os.makedirs(self.strategy.args.use_tensorboard, exist_ok=True)
@@ -663,7 +663,7 @@ class ActorPPOTrainer(BasePPOTrainer):
                     logs.update({f"perf/experience_maker/{k}": v for k, v in self.experience_maker.perf_stats.items()})
                 self._wandb.log(logs)
             # TensorBoard
-            elif self._tensorboard is not None and self.strategy.is_rank_0():
+            if self._tensorboard is not None and self.strategy.is_rank_0():
                 for k, v in logs_dict.items():
                     self._tensorboard.add_scalar(f"train/{k}", v, global_step)
                 if self.experience_maker.perf_stats is not None:
