@@ -465,7 +465,7 @@ class ActorPPOTrainer(BasePPOTrainer):
         else:
             kl_loss = 0
 
-        # 应用熵正则化损失
+        # Apply entropy regularization loss
         if self.entropy_loss is not None:
             entropy_reg_loss = self.entropy_loss(action_log_probs, experience.action_mask)
             entropy_value = self.entropy_loss.get_entropy(action_log_probs, experience.action_mask)
@@ -480,7 +480,7 @@ class ActorPPOTrainer(BasePPOTrainer):
         else:
             aux_loss = 0
             
-        # 将熵正则化损失添加到总损失中
+        # Add entropy regularization loss to total loss
         loss = actor_loss + aux_loss * self.args.aux_loss_coef + kl_loss * self.kl_ctl.value
         if self.entropy_loss is not None:
             loss += entropy_reg_loss
@@ -529,7 +529,7 @@ class ActorPPOTrainer(BasePPOTrainer):
         entropy = -(action_log_probs.exp() * action_log_probs).sum(dim=-1).mean()
         status["entropy"] = entropy.item()
         
-        # 添加熵正则化损失到状态信息
+        # Add entropy regularization loss to status information
         if self.entropy_loss is not None:
             status["entropy_reg_loss"] = entropy_reg_loss.item()
             status["entropy_coef"] = self.entropy_loss.current_coef
