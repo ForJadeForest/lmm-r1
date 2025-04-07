@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.optim import Optimizer
 
-from openrlhf.models import Actor, GPTLMLoss, PolicyLoss, ValueLoss
+from openrlhf.models import Actor, GPTLMLoss, PolicyLoss, ValueLoss, EntropyRegularizationLoss
 
 from .ppo_utils import AdaptiveKLController, Experience, FixedKLController, NaiveReplayBuffer
 
@@ -129,6 +129,17 @@ class BasePPOTrainer(ABC):
         self.actor_loss_fn = PolicyLoss(eps_clip)
         self.critic_loss_fn = ValueLoss(value_clip)
         self.ptx_loss_fn = GPTLMLoss()
+
+        # 初始化熵正则化损失
+        if hasattr(self.args, "use_entropy_loss") and self.args.use_entropy_loss:
+            self.entropy_loss = EntropyRegularizationLoss(
+                initial_coef=self.args.entropy_coef,
+                decay_rate=self.args.entropy_decay_rate,
+                decay_strategy=self.args.entropy_decay_strategy,
+                regularization_ratio=self.args.entropy_regularization_ratio
+            )
+        else:
+            self.entropy_loss = None
 
         self.freezing_actor_steps = getattr(self.args, "freezing_actor_steps", -1)
 

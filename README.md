@@ -39,6 +39,9 @@
 
 - [2025/2/13] We release code of LMM-R1!
 
+## Recently Update
+- [2025/4/7] ⚙️ Implemented warm-up style entropy coefficient scheduling, enabling higher exploration in early training and focusing on exploitation later
+
 ## Introduction
 
 Smaller 3B Large Multimodal Models (LMMs) struggle with reasoning tasks due to their limited parameter capacity and the inherent complexity of integrating visual perception with logical reasoning. High-quality multimodal reasoning data is also scarce, further complicating training. To address these challenges, we propose **LMM-R1**, a two-stage rule-based RL framework that efficiently enhances reasoning capabilities:

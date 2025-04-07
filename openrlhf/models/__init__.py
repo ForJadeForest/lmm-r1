@@ -10,6 +10,7 @@ from .loss import (
     PRMLoss,
     ValueLoss,
     VanillaKTOLoss,
+    EntropyRegularizationLoss,
 )
 from .model import get_llm_for_sequence_regression
 
@@ -26,4 +27,5 @@ __all__ = [
     "ValueLoss",
     "VanillaKTOLoss",
     "get_llm_for_sequence_regression",
+    "EntropyRegularizationLoss",
 ]

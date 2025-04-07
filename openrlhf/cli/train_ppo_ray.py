@@ -374,6 +374,24 @@ if __name__ == "__main__":
         default=False,
         help="disable dividing by std for advantages while keeping mean normalization",
     )
+    
+    # Entropy regularization
+    parser.add_argument("--use_entropy_loss", action="store_true", default=False, help="Whether to use entropy regularization loss")
+    parser.add_argument("--entropy_coef", type=float, default=0.01, help="Initial entropy coefficient")
+    parser.add_argument("--entropy_decay_rate", type=float, default=0.9, help="Entropy coefficient decay rate")
+    parser.add_argument(
+        "--entropy_decay_strategy", 
+        type=str, 
+        choices=["linear", "exponential", "cosine"], 
+        default="exponential", 
+        help="Entropy coefficient decay strategy"
+    )
+    parser.add_argument(
+        "--entropy_regularization_ratio", 
+        type=float, 
+        default=0.1, 
+        help="Ratio of training steps to gradually decrease entropy coefficient to zero"
+    )
 
     # Context Parallel
     parser.add_argument("--ring_attn_size", type=int, default=1, help="Ring attention group size")

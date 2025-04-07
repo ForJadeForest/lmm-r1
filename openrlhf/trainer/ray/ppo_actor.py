@@ -193,7 +193,14 @@ class ActorPPOTrainer(BasePPOTrainer):
             disable=not self.strategy.is_rank_0(),
             initial=steps-1,
         )
+        max_steps = args.max_global_steps
+        
         while steps <= args.max_global_steps:
+            # Update entropy regularization coefficient
+            if self.entropy_loss is not None:
+                progress = float(steps) / max_steps
+                self.entropy_loss.update_coef(progress)
+
             if isinstance(self.prompts_dataloader.sampler, DistributedSampler):
                 self.prompts_dataloader.sampler.set_epoch(
                     episode, consumed_samples=0 if episode > start_episode else consumed_samples
@@ -458,12 +465,26 @@ class ActorPPOTrainer(BasePPOTrainer):
         else:
             kl_loss = 0
 
+        # 应用熵正则化损失
+        if self.entropy_loss is not None:
+            entropy_reg_loss = self.entropy_loss(action_log_probs, experience.action_mask)
+            entropy_value = self.entropy_loss.get_entropy(action_log_probs, experience.action_mask)
+            experience.info["entropy"] = entropy_value.item()
+            experience.info["entropy_coef"] = self.entropy_loss.current_coef
+        else:
+            entropy_reg_loss = 0
+
         # mixtral
         if self.aux_loss:
             aux_loss = output.aux_loss
         else:
             aux_loss = 0
+            
+        # 将熵正则化损失添加到总损失中
         loss = actor_loss + aux_loss * self.args.aux_loss_coef + kl_loss * self.kl_ctl.value
+        if self.entropy_loss is not None:
+            loss += entropy_reg_loss
+            
         self.strategy.backward(loss, self.actor, self.actor_optim)
 
         # ptx loss
@@ -507,6 +528,11 @@ class ActorPPOTrainer(BasePPOTrainer):
         # where p(x) = exp(action_log_probs)
         entropy = -(action_log_probs.exp() * action_log_probs).sum(dim=-1).mean()
         status["entropy"] = entropy.item()
+        
+        # 添加熵正则化损失到状态信息
+        if self.entropy_loss is not None:
+            status["entropy_reg_loss"] = entropy_reg_loss.item()
+            status["entropy_coef"] = self.entropy_loss.current_coef
 
         if self.pretrain_dataloader is not None:
             status["ptx_loss"] = ptx_loss.item()
