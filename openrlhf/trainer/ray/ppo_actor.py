@@ -465,12 +465,13 @@ class ActorPPOTrainer(BasePPOTrainer):
         else:
             kl_loss = 0
 
-        # Apply entropy regularization loss
-        if self.entropy_loss is not None:
+        entropy_value = self.entropy_loss.get_entropy(action_log_probs, experience.action_mask)
+        experience.info["entropy"] = entropy_value
+        experience.info["entropy_coef"] = torch.tensor(self.entropy_loss.current_coef, device=action_log_probs.device)
+        
+        # Only apply entropy regularization loss when use_entropy_loss is True
+        if self.use_entropy_loss:
             entropy_reg_loss = self.entropy_loss(action_log_probs, experience.action_mask)
-            entropy_value = self.entropy_loss.get_entropy(action_log_probs, experience.action_mask)
-            experience.info["entropy"] = entropy_value.item()
-            experience.info["entropy_coef"] = self.entropy_loss.current_coef
         else:
             entropy_reg_loss = 0
 
@@ -482,7 +483,7 @@ class ActorPPOTrainer(BasePPOTrainer):
             
         # Add entropy regularization loss to total loss
         loss = actor_loss + aux_loss * self.args.aux_loss_coef + kl_loss * self.kl_ctl.value
-        if self.entropy_loss is not None:
+        if self.use_entropy_loss:
             loss += entropy_reg_loss
             
         self.strategy.backward(loss, self.actor, self.actor_optim)
@@ -524,13 +525,9 @@ class ActorPPOTrainer(BasePPOTrainer):
             "clipped_high_ratio": (clipped_high_count / total_count).item() if total_count > 0 else 0.0,
             "clipped_low_ratio": (clipped_low_count / total_count).item() if total_count > 0 else 0.0,
         }
-        # Calculate the Entropy of the action logits. Use action_log_probs to compute entropy: H = -Σ p(x) * log p(x)
-        # where p(x) = exp(action_log_probs)
-        entropy = -(action_log_probs.exp() * action_log_probs).sum(dim=-1).mean()
-        status["entropy"] = entropy.item()
         
-        # Add entropy regularization loss to status information
-        if self.entropy_loss is not None:
+        # Only add entropy_reg_loss when we're using entropy regularization
+        if self.use_entropy_loss:
             status["entropy_reg_loss"] = entropy_reg_loss.item()
             status["entropy_coef"] = self.entropy_loss.current_coef
 

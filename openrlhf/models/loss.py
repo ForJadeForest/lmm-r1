@@ -338,6 +338,9 @@ class EntropyRegularizationLoss(nn.Module):
         Args:
             progress: Training progress (0.0 to 1.0)
         """
+        # If coefficient has been set to 0, skip update. 
+        if self.current_coef == 0.0:
+            return
         # Only use entropy regularization during the regularization period
         if progress >= self.regularization_ratio:
             self.current_coef = 0.0
