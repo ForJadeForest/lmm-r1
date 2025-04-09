@@ -83,14 +83,13 @@ class PolicyLoss(nn.Module):
             clipped_high = clipped_high * action_mask
             clipped_low = clipped_low * action_mask
             
-        clipped_high_count = clipped_high.sum()
-        clipped_low_count = clipped_low.sum()
-        total_count = action_mask.sum() if action_mask is not None else torch.prod(torch.tensor(ratio.shape))
+        clipped_high_count = clipped_high.sum(dim=-1)
+        clipped_low_count = clipped_low.sum(dim=-1)
         
         # Original loss calculation
         loss = masked_mean(loss, action_mask, dim=-1).mean()
         
-        return loss, clipped_high_count, clipped_low_count, total_count
+        return loss, clipped_high_count, clipped_low_count
 
 
 class ValueLoss(nn.Module):
@@ -409,8 +408,8 @@ class EntropyRegularizationLoss(nn.Module):
             entropy = masked_mean(entropy, action_mask, dim=-1)
         else:
             entropy = entropy.mean(dim=-1)
-            
-        return entropy.mean()
+
+        return entropy
 
 
 class PRMLoss(nn.Module):

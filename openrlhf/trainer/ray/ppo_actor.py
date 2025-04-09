@@ -336,8 +336,10 @@ class ActorPPOTrainer(BasePPOTrainer):
                 # weighted mean for kl
                 if "kl" in status:
                     status["kl"] *= status["response_length"]
+                    status["entropy"] *= status["response_length"]
                     status = self.strategy.all_reduce(status)
                     status["kl"] /= status["response_length"]
+                    status["entropy"] /= status["response_length"]
 
                 short_status = {}
 
@@ -437,7 +439,7 @@ class ActorPPOTrainer(BasePPOTrainer):
             action_mask=experience.action_mask,
         )
         # Unpack the return values
-        actor_loss, clipped_high_count, clipped_low_count, total_count = actor_loss_results
+        actor_loss, clipped_high_count, clipped_low_count = actor_loss_results
         
 
         if self.args.use_kl_loss:
@@ -465,10 +467,6 @@ class ActorPPOTrainer(BasePPOTrainer):
         else:
             kl_loss = 0
 
-        entropy_value = self.entropy_loss.get_entropy(action_log_probs, experience.action_mask)
-        experience.info["entropy"] = entropy_value
-        experience.info["entropy_coef"] = torch.tensor(self.entropy_loss.current_coef, device=action_log_probs.device)
-        
         # Only apply entropy regularization loss when use_entropy_loss is True
         if self.use_entropy_loss:
             entropy_reg_loss = self.entropy_loss(action_log_probs, experience.action_mask)
@@ -522,19 +520,22 @@ class ActorPPOTrainer(BasePPOTrainer):
             "actor_lr": self.actor_scheduler.get_last_lr()[0],
             "clipped_high_count": clipped_high_count.item(),
             "clipped_low_count": clipped_low_count.item(),
-            "clipped_high_ratio": (clipped_high_count / total_count).item() if total_count > 0 else 0.0,
-            "clipped_low_ratio": (clipped_low_count / total_count).item() if total_count > 0 else 0.0,
+            "clipped_high_ratio": (clipped_high_count / experience.info["response_length"]).item(),
+            "clipped_low_ratio": (clipped_low_count / experience.info["response_length"]).item(),
         }
         
         # Only add entropy_reg_loss when we're using entropy regularization
         if self.use_entropy_loss:
             status["entropy_reg_loss"] = entropy_reg_loss.item()
             status["entropy_coef"] = self.entropy_loss.current_coef
+        # entropy value: (Bs, )
+        entropy_value = self.entropy_loss.get_entropy(action_log_probs, experience.action_mask)
+        status["entropy"] = entropy_value
 
         if self.pretrain_dataloader is not None:
             status["ptx_loss"] = ptx_loss.item()
         for k, v in experience.info.items():
-            if k == "kl":
+            if k in ["kl", "entropy"]:
                 status[k] = (
                     (v * experience.info["response_length"]).sum() / experience.info["response_length"].sum()
                 ).item()
