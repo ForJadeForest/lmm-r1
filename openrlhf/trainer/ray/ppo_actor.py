@@ -3,6 +3,8 @@ import itertools
 import math
 import os
 import socket
+import time
+from datetime import timedelta
 from typing import Callable, Dict, List
 
 import deepspeed
@@ -15,8 +17,7 @@ from transformers.trainer import get_scheduler
 
 from openrlhf.datasets import PromptDataset, SFTDataset
 from openrlhf.models import Actor
-from openrlhf.models.ring_attn_utils import pad_sequences, unpad_sequences
-from openrlhf.models.utils import compute_approx_kl, masked_mean, unpacking_samples
+from openrlhf.models.utils import compute_approx_kl, masked_mean
 from openrlhf.trainer import BasePPOTrainer
 from openrlhf.trainer.ppo_utils import Experience, RemoteExperienceMaker
 from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
@@ -24,9 +25,14 @@ from openrlhf.utils import blending_datasets, get_tokenizer
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.utils.deepspeed.deepspeed_utils import offload_deepspeed_states, reload_deepspeed_states
 from openrlhf.utils.distributed_sampler import DistributedSampler
-from openrlhf.utils.distributed_util import init_process_group
 from openrlhf.models.lmm_kits.utils import get_data_processor
 from peft.peft_model import PeftModel
+from openrlhf.utils.distributed_util import init_process_group, torch_dist_barrier_and_cuda_sync
+from openrlhf.utils.logging_utils import init_logger
+from openrlhf.utils.remote_rm_utils import remote_rm_fn_ray
+
+logger = init_logger(__name__)
+
 from .launcher import BasePPORole
 from .utils import get_physical_gpu_id
 
@@ -159,13 +165,14 @@ class ActorPPOTrainer(BasePPOTrainer):
 
             ray.get(refs)
 
-        torch.distributed.barrier()
+        torch_dist_barrier_and_cuda_sync()
 
     def fit(
         self,
         args,
         prompts_dataloader,
         pretrain_dataloader,
+        eval_dataloader,
         consumed_samples=0,
         num_rollouts_per_episodes=1,
         trained_steps=0,
@@ -180,6 +187,7 @@ class ActorPPOTrainer(BasePPOTrainer):
         self.prompts_dataloader = prompts_dataloader
         self.pretrain_dataloader = pretrain_dataloader
         self.replay_buffer.set_limit(prompts_dataloader.batch_size * args.n_samples_per_prompt)
+        self.eval_dataloader = eval_dataloader
 
         # Restore step and start_epoch
         steps = trained_steps + 1
@@ -201,7 +209,7 @@ class ActorPPOTrainer(BasePPOTrainer):
                     episode, consumed_samples=0 if episode > start_episode else consumed_samples
                 )
 
-            for rand_prompts, labels in self.prompts_dataloader:
+            for _, rand_prompts, labels in self.prompts_dataloader:
                 total_consumed_samples += len(rand_prompts)
                 for i, experience in enumerate(
                     self.experience_maker.make_experience_list(rand_prompts, labels, **self.generate_kwargs)
@@ -254,7 +262,7 @@ class ActorPPOTrainer(BasePPOTrainer):
     def ppo_train(self, global_steps):
         # 1. ensure all experience makers done
         self.experience_maker.flush()
-        torch.distributed.barrier()
+        torch_dist_barrier_and_cuda_sync()
         status = {}
 
         # 2. triger remote critic model training
@@ -271,7 +279,7 @@ class ActorPPOTrainer(BasePPOTrainer):
                 ray.get(self.critic.offload_states.remote())
 
         if self.strategy.args.colocate_all_models:
-            torch.distributed.barrier()
+            torch_dist_barrier_and_cuda_sync()
 
         # 3. actor model training
         if global_steps > self.freezing_actor_steps:
@@ -290,19 +298,17 @@ class ActorPPOTrainer(BasePPOTrainer):
                 if self.strategy.args.vllm_enable_sleep:
                     batch_vllm_engine_call(self.vllm_engines, "wake_up")
 
-                torch.distributed.barrier()
-                torch.cuda.synchronize()
+                torch_dist_barrier_and_cuda_sync()
                 self._broadcast_to_vllm()
 
                 if self.strategy.args.vllm_enable_sleep:
                     batch_vllm_engine_call(self.vllm_engines, "sleep")
-                    torch.distributed.barrier()
-                    torch.cuda.synchronize()
+                    torch_dist_barrier_and_cuda_sync()
 
         # 5. wait remote critic model training done
         if self.critic_train_remote and not self.strategy.args.colocate_all_models:
             status.update(ray.get(critic_status_ref))
-        torch.distributed.barrier()
+        torch_dist_barrier_and_cuda_sync()
 
         return status
 
@@ -377,58 +383,25 @@ class ActorPPOTrainer(BasePPOTrainer):
     def training_step(self, experience: Experience) -> Dict[str, float]:
         self.actor.train()
 
-        # TODO: this is a bad indicator to say that data is packed...
-        if isinstance(experience.sequences, list):
-            sequences = torch.cat(experience.sequences, dim=0).unsqueeze(0)
-            old_action_log_probs = torch.cat(experience.action_log_probs, dim=0).unsqueeze(0)
-            advantages = torch.cat(experience.advantages, dim=0).unsqueeze(0)
-            num_actions = [v.numel() for v in experience.advantages]
-            packed_seq_lens = [s.numel() for s in experience.sequences]
-            attention_mask = torch.cat(
-                [torch.full_like(s, i + 1) for i, s in enumerate(experience.sequences)], dim=0
-            ).unsqueeze(0)
-            visual_inputs = experience.visual_inputs
-            # pad seq makes the sequence a multiple of ring_attention_size.
-            if self.strategy.ring_attn_group is not None:
-                pad_len, sequences, attention_mask, num_actions, packed_seq_lens = pad_sequences(
-                    sequences, attention_mask, num_actions, packed_seq_lens, self.strategy.ring_attn_group
-                )
-            if self.args.use_kl_loss and experience.base_action_log_probs is not None:
-                base_action_log_probs = torch.cat(experience.base_action_log_probs, dim=0).unsqueeze(0)
-        else:
-            sequences = experience.sequences
-            old_action_log_probs = experience.action_log_probs
-            advantages = experience.advantages
-            num_actions = experience.action_mask.size(1)
-            packed_seq_lens = None
-            attention_mask = experience.attention_mask
-            visual_inputs = experience.visual_inputs
-            if self.args.use_kl_loss and experience.base_action_log_probs is not None:
-                base_action_log_probs = experience.base_action_log_probs
+        sequences = experience.sequences
+        action_mask = experience.action_mask
+        attention_mask = experience.attention_mask
+        packed_seq_lens = None
+        old_action_log_probs = experience.action_log_probs
+        advantages = experience.advantages
+        base_action_log_probs = experience.base_action_log_probs
+        visual_inputs = experience.visual_inputs
 
         # actor loss
         action_log_probs, output = self.actor(
             sequences,
-            num_actions,
+            action_mask,
             attention_mask=attention_mask,
             return_output=True,
             ring_attn_group=self.strategy.ring_attn_group,
-            logps_allgather=True,
             packed_seq_lens=packed_seq_lens,
             visual_inputs=visual_inputs
         )
-        # unpad sequence ensures that pad tokens do not contribute to the loss calculation.
-        if self.strategy.ring_attn_group is not None:
-            assert pad_len is not None
-            sequences, attention_mask, num_actions, packed_seq_lens, action_log_probs, _, _ = unpad_sequences(
-                pad_len=pad_len,
-                sequences=sequences,
-                attention_mask=attention_mask,
-                num_actions=num_actions,
-                packed_seq_lens=packed_seq_lens,
-                action_log_probs=action_log_probs,
-                ring_attn_group=self.strategy.ring_attn_group,
-            )
 
         # loss function
         actor_loss_results = self.actor_loss_fn(
@@ -446,20 +419,11 @@ class ActorPPOTrainer(BasePPOTrainer):
                 kl = compute_approx_kl(
                     action_log_probs,
                     base_action_log_probs,
-                    experience.action_mask,
                     kl_estimator=self.args.kl_estimator,
                 )
             else:
                 kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=action_log_probs.device)
-
-            if not self.args.packing_samples:
-                kl_mean = masked_mean(kl, experience.action_mask, dim=-1)
-            else:
-                # convert tensor into list of tensors so that it's easier to manipulate
-                # within dataset.
-
-                kl = unpacking_samples(kl, num_actions)
-                kl_mean = torch.tensor([each_kl.mean() for each_kl in kl], device=action_log_probs.device)
+            kl_mean = masked_mean(kl, experience.action_mask, dim=-1)
 
             kl_loss = kl_mean.mean()
             experience.info["kl"] = kl_loss.item()
@@ -515,7 +479,7 @@ class ActorPPOTrainer(BasePPOTrainer):
 
         # status
         status = {
-            "policy_loss": actor_loss.item(), 
+            "policy_loss": actor_loss.detach().item(), 
             "actor_lr": self.actor_scheduler.get_last_lr()[0],
             "clipped_high_count": clipped_high_count.item(),
             "clipped_low_count": clipped_low_count.item(),
@@ -626,8 +590,7 @@ class ActorPPOTrainer(BasePPOTrainer):
                             for engine in self.vllm_engines
                         ]
                         ray.get(refs)
-                    torch.distributed.barrier()
-                    torch.cuda.synchronize()
+                    torch_dist_barrier_and_cuda_sync()
 
     def _broadcast_to_vllm(self):
         use_prefix_cache = getattr(self.strategy.args, "enable_prefix_caching", False)
@@ -669,7 +632,7 @@ class ActorPPOTrainer(BasePPOTrainer):
         if cache_reset_refs:
             ray.get(cache_reset_refs)
         torch.cuda.empty_cache()
-        torch.distributed.barrier()
+        torch_dist_barrier_and_cuda_sync()
 
     def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}):
         if global_step % args.logging_steps == 0:
@@ -694,9 +657,8 @@ class ActorPPOTrainer(BasePPOTrainer):
                         self._tensorboard.add_scalar(f"perf/experience_maker/{k}", v, global_step)
 
         # TODO: Add evaluation mechanism for PPO
-        if global_step % args.eval_steps == 0:
-            # self.evaluate(self.eval_dataloader, global_step)
-            pass
+        if global_step % args.eval_steps == 0 and self.eval_dataloader and len(self.eval_dataloader) > 0:
+            self.evaluate(self.eval_dataloader, global_step, args.eval_temperature, args.eval_n_samples_per_prompt)
         # save ckpt
         # TODO: save best model on dev, use loss/perplexity/others on whole dev dataset as metric
         if global_step % args.save_steps == 0:
@@ -727,7 +689,127 @@ class ActorPPOTrainer(BasePPOTrainer):
         if not self.disable_ds_ckpt:
             if self.critic_train_remote:
                 ray.get(ref)
-        torch.distributed.barrier()
+        torch_dist_barrier_and_cuda_sync()
+
+    def evaluate(self, eval_dataloader, global_step, temperature=0.6, n_samples_per_prompt=1):
+        """Evaluate model performance on eval dataset.
+
+        Args:
+            eval_dataloader: DataLoader containing evaluation prompts, labels and data sources
+            global_step: Current training step for logging
+            n_samples_per_prompt: Number of samples to generate per prompt for pass@k calculation
+        """
+        start_time = time.time()
+        if self.strategy.is_rank_0():
+            logger.info(f"⏰ Evaluation start time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # vLLM wakeup when vllm_enable_sleep
+        if self.strategy.args.vllm_enable_sleep:
+            from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
+
+            batch_vllm_engine_call(self.vllm_engines, "wake_up")
+            torch_dist_barrier_and_cuda_sync()
+
+        # Only run evaluation on ring attention rank0
+        if self.strategy.ring_attn_group is None or self.strategy.ring_attn_rank == 0:
+
+            with torch.no_grad():
+                # First collect all prompts and labels
+                all_prompts = []
+                all_labels = []
+                all_datasources = []
+
+                for datasources, prompts, labels in eval_dataloader:
+                    all_prompts.extend(prompts)
+                    all_labels.extend(labels)
+                    all_datasources.extend(datasources)
+
+                # Generate samples and calculate rewards
+                generate_kwargs = self.generate_kwargs.copy()
+                generate_kwargs["temperature"] = temperature
+                generate_kwargs["n_samples_per_prompt"] = n_samples_per_prompt
+                samples = self.experience_maker.generate_samples(all_prompts, all_labels, **generate_kwargs)
+                queries = [self.tokenizer.batch_decode(seq, skip_special_tokens=False) for seq in samples.sequences]
+
+                # duplicate prompts and labels for each sample
+                all_prompts = sum([[prompt] * n_samples_per_prompt for prompt in all_prompts], [])
+                all_labels = sum([[label] * n_samples_per_prompt for label in all_labels], [])
+
+                # Calculate rewards
+                if self.experience_maker.custom_reward_func:
+                    rewards = self.experience_maker.custom_reward_func.remote(queries, all_prompts, all_labels)
+                else:
+                    rank = torch.distributed.get_rank() // self.strategy.ring_attn_size
+                    rm = self.remote_rm_url[rank % len(self.remote_rm_url)]
+                    rewards = remote_rm_fn_ray.remote(rm, queries=queries, prompts=all_prompts, labels=all_labels)
+                rewards = ray.get(rewards)
+
+                # Reshape rewards to (num_prompts, n_samples_per_prompt)
+                rewards = rewards.reshape(-1, n_samples_per_prompt)
+
+                # Collect local statistics for each data source
+                local_metrics = {}  # {datasource: {"pass{n_samples_per_prompt}": 0, "pass1": 0, "count": 0}}
+
+                for i, datasource in enumerate(all_datasources):
+                    if datasource not in local_metrics:
+                        local_metrics[datasource] = {f"pass{n_samples_per_prompt}": 0, "pass1": 0, "count": 0}
+
+                    # Calculate pass@k and pass@1
+                    prompt_rewards = rewards[i]
+                    local_metrics[datasource][f"pass{n_samples_per_prompt}"] += prompt_rewards.max().float().item()
+                    local_metrics[datasource]["pass1"] += prompt_rewards.mean().float().item()
+                    local_metrics[datasource]["count"] += 1
+
+                # All gather metrics from all ranks
+                gathered_metrics = [None] * (self.strategy.world_size // self.strategy.ring_attn_size)
+                if self.strategy.ring_attn_group is not None:
+                    # Only rank 0 in ring attention group gathers metrics
+                    torch.distributed.all_gather_object(
+                        gathered_metrics, local_metrics, group=self.experience_maker.ring_rank0_group
+                    )
+                else:
+                    torch.distributed.all_gather_object(gathered_metrics, local_metrics)
+
+                # Only rank0 processes the gathered metrics
+                if self.strategy.is_rank_0():
+                    # Combine metrics from all ranks
+                    global_metrics = {}
+                    for rank_metrics in gathered_metrics:
+                        for datasource, metrics in rank_metrics.items():
+                            if datasource not in global_metrics:
+                                global_metrics[datasource] = {f"pass{n_samples_per_prompt}": 0, "pass1": 0, "count": 0}
+                            global_metrics[datasource][f"pass{n_samples_per_prompt}"] += metrics[
+                                f"pass{n_samples_per_prompt}"
+                            ]
+                            global_metrics[datasource]["pass1"] += metrics["pass1"]
+                            global_metrics[datasource]["count"] += metrics["count"]
+
+                    # Calculate global averages
+                    logs = {}
+                    for datasource, metrics in global_metrics.items():
+                        logs[f"eval_{datasource}_pass{n_samples_per_prompt}"] = (
+                            metrics[f"pass{n_samples_per_prompt}"] / metrics["count"]
+                        )
+                        logs[f"eval_{datasource}_pass1"] = metrics["pass1"] / metrics["count"]
+
+                    # Log to wandb/tensorboard
+                    if self._wandb is not None:
+                        logs = {"eval/%s" % k: v for k, v in {**logs, "global_step": global_step}.items()}
+                        self._wandb.log(logs)
+                    elif self._tensorboard is not None:
+                        for k, v in logs.items():
+                            self._tensorboard.add_scalar(f"eval/{k}", v, global_step)
+
+        if self.strategy.args.vllm_enable_sleep:
+            batch_vllm_engine_call(self.vllm_engines, "sleep")
+
+        torch.cuda.empty_cache()
+
+        end_time = time.time()
+        duration = end_time - start_time
+        if self.strategy.is_rank_0():
+            time_str = str(timedelta(seconds=duration)).split(".")[0]
+            logger.info(f"✨ Evaluation completed in {time_str}")
 
     def reload_states(self):
         reload_deepspeed_states(self.actor.model)
@@ -868,19 +950,17 @@ class ActorModelRayActor(BasePPORole):
         args = self.strategy.args
 
         # prepare datasets
-        prompts_data = blending_datasets(
+        train_data = blending_datasets(
             args.prompt_data,
             args.prompt_data_probs,
             strategy,
             args.seed,
             max_count=args.max_samples,
-            return_eval=False,
-            train_split=args.prompt_split,
         )
-        prompts_data = prompts_data.select(range(min(args.max_samples, len(prompts_data))))
-        self.prompts_dataset = PromptDataset(
-            prompts_data, self.tokenizer, strategy, input_template=args.input_template
-        )
+
+        # Create train dataset
+        train_data = train_data.select(range(min(args.max_samples, len(train_data))))
+        self.prompts_dataset = PromptDataset(train_data, self.tokenizer, strategy, input_template=args.input_template)
         self.prompts_dataloader = strategy.setup_dataloader(
             self.prompts_dataset,
             args.rollout_batch_size // (strategy.world_size // strategy.ring_attn_size),
@@ -888,14 +968,30 @@ class ActorModelRayActor(BasePPORole):
             True,
         )
 
+        # Create eval dataset if eval data exists
+        if getattr(args, "eval_dataset", None):
+            eval_data = blending_datasets(
+                args.eval_dataset,
+                None,  # No probability sampling for eval datasets
+                strategy,
+            )
+            eval_data = eval_data.select(range(min(args.max_samples, len(eval_data))))
+            eval_dataset = PromptDataset(eval_data, self.tokenizer, strategy, input_template=args.input_template)
+            self.eval_dataloader = strategy.setup_dataloader(
+                eval_dataset,
+                1,
+                True,
+                False,
+            )
+        else:
+            self.eval_dataloader = None
+
         if args.pretrain_data:
             pretrain_data = blending_datasets(
                 args.pretrain_data,
                 args.pretrain_data_probs,
                 strategy,
                 args.seed,
-                return_eval=False,
-                train_split=args.pretrain_split,
             )
             pretrain_max_len = args.max_len if args.max_len else args.prompt_max_len + args.generate_max_len
             pretrain_dataset = SFTDataset(
@@ -995,21 +1091,20 @@ class ActorModelRayActor(BasePPORole):
             # vLLM wakeup when vllm_enable_sleep
             if self.strategy.args.vllm_enable_sleep:
                 batch_vllm_engine_call(vllm_engines, "wake_up")
-            torch.distributed.barrier()
-            torch.cuda.synchronize()
+            torch_dist_barrier_and_cuda_sync()
 
             trainer._broadcast_to_vllm()
 
             # vLLM offload when vllm_enable_sleep
             if self.strategy.args.vllm_enable_sleep:
                 batch_vllm_engine_call(vllm_engines, "sleep")
-                torch.distributed.barrier()
-                torch.cuda.synchronize()
+                torch_dist_barrier_and_cuda_sync()
 
         trainer.fit(
             args,
             self.prompts_dataloader,
             self.pretrain_dataloader,
+            self.eval_dataloader,
             self.consumed_samples,
             self.num_rollouts_per_episodes,
             self.trained_steps,

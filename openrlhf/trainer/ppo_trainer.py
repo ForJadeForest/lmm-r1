@@ -3,7 +3,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 from torch.optim import Optimizer
 
 from openrlhf.models import Actor, GPTLMLoss, PolicyLoss, ValueLoss, EntropyRegularizationLoss
@@ -40,7 +39,7 @@ class BasePPOTrainer(ABC):
         gradient_checkpointing (bool, defaults to False): If True, enables gradient checkpointing.
         max_epochs (int, defaults to 1): Number of epochs to train.
         max_norm (float, defaults to 1.0): Maximum gradient norm for gradient clipping.
-        tokenizer (Callable, optional): Tokenizer for input data.
+        data_processor (Callable, optional): Data processor for input data.
         prompt_max_len (int, defaults to 128): Maximum length for prompts.
         dataloader_pin_memory (bool, defaults to True): If True, pins memory in the data loader.
         remote_rm_url (str, optional): URL for remote reward model API.

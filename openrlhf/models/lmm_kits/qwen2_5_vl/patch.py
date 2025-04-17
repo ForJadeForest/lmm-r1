@@ -53,14 +53,20 @@ class Qwen2_5_VLPatch(BasePatch):
 
     def _add_get_position_ids():
         from transformers import Qwen2_5_VLForConditionalGeneration
-        def get_position_ids(self, input_ids, image_grid_thw=None, video_grid_thw=None, attention_mask=None, **kwargs):
+        def get_position_ids(self, input_ids, image_grid_thw=None, video_grid_thw=None, attention_mask=None, packing=False, **kwargs):
             position_ids,mrope_position_deltas = self.get_rope_index(input_ids=input_ids, image_grid_thw=image_grid_thw, video_grid_thw=video_grid_thw, attention_mask=attention_mask)
+            if packing:
+                # For packing, the position_ids will be unpaded and sliced later, which needs the shape: [bs,seq_len,...]
+                # However, the position_ids of Qwen2.5VL is [3,bs,seq_len], so we need to permute it.
+                position_ids = position_ids.permute(1,2,0) # [3,bs,seq_len] -> [bs,seq_len,3]
             return position_ids
         Qwen2_5_VLForConditionalGeneration.get_position_ids = get_position_ids
 
     def _add_offset_split_position_ids():
         from transformers import Qwen2_5_VLForConditionalGeneration
         def offset_split_position_ids(self,position_ids,hacked_position_ids):
+            # This function is only called when using packing, in which case, the position_ids is permuted as [bs,seq_len,3]
+            position_ids = position_ids.permute(2,0,1) # [bs,seq_len,3] -> [3,bs,seq_len]
             new_position_ids = position_ids.clone()
             for i in range(hacked_position_ids.size(0)):
                 seq_idxes = torch.nonzero(hacked_position_ids[i]==0)[:,0]

@@ -88,6 +88,7 @@ def train(args):
             args.vllm_tensor_parallel_size,
             args.pretrain,
             args.seed,
+            args.full_determinism,
             args.enable_prefix_caching,
             args.enforce_eager,
             max_len,
@@ -357,7 +358,6 @@ if __name__ == "__main__":
     parser.add_argument("--freeze_prefix", type=str, nargs="+", default=None,
         help="List of parameter name prefixes to freeze during training"
     )
-    parser.add_argument("--drop_maxlen", action="store_true", default=False)
     parser.add_argument("--processor_kwargs",type=str,default=None,help="Processor kwargs. Should be a json string. There are always two keys: min_pixels and max_pixels, which are the minimum and maximum number of pixels for the image. If not provided, the default values are 4*28*28 and 16384*28*28 respectively.")
     # Reinforce
     parser.add_argument(
@@ -417,15 +417,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--prompt_data_probs",
         type=str,
-        default="1.0",
+        default=None,
         help="sampling probs for datasets",
     )
-    parser.add_argument("--prompt_split", type=str, default="train")
+    parser.add_argument("--eval_dataset", type=str, default=None, help="Path to the evaluation dataset")
+    parser.add_argument("--eval_temperature", type=float, default=0.6, help="Temperature for evaluation")
+    parser.add_argument(
+        "--eval_n_samples_per_prompt", type=int, default=4, help="Number of samples per prompt for evaluation"
+    )
     parser.add_argument("--pretrain_data", type=str, default=None, help="HF dataset name or path")
     parser.add_argument(
         "--pretrain_data_probs",
         type=str,
-        default="1.0",
+        default=None,
         help="sampling probs for datasets",
     )
     parser.add_argument("--pretrain_split", type=str, default="train")
@@ -497,6 +501,9 @@ if __name__ == "__main__":
     if args.vllm_enable_sleep and not args.colocate_all_models:
         print("Set args.vllm_enable_sleep to False when args.colocate_all_models is disabled.")
         args.vllm_enable_sleep = False
+
+    if args.eval_dataset:
+        assert args.remote_rm_url, "`--eval_dataset` is only supported with `--remote_rm_url`."
 
     if args.use_ms:
         from modelscope.utils.hf_util import patch_hub

@@ -109,7 +109,7 @@ class DeepspeedStrategy(ABC):
                     (i + 1) * self.ring_attn_size,
                 )
             )
-            group = dist.new_group(ranks=ring_attn_ranks, backend="nccl")
+            group = dist.new_group(ranks=ring_attn_ranks, backend="nccl",timeout=timedelta(minutes=60))
             if dist.get_rank() in ring_attn_ranks:
                 set_ring_attn_group(group)
                 self.ring_attn_rank = dist.get_rank(group=group)

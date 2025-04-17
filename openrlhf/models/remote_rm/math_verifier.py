@@ -68,8 +68,7 @@ def verify_math(content,sol):
                         nits=False,
                         malformed_operators=False,
                         basic_latex=True,
-                        equations=True,
-                        boxed=True,
+                        boxed='all',
                         units=True,
                     ),
                     # Ensures that boxed is tried first
@@ -83,7 +82,7 @@ def verify_math(content,sol):
         try:
             reward = float(verify(answer_parsed, gold_parsed))
         except Exception as e:
-            reward = 1.0
+            reward = 0.0
             print("Failed to verify: ", e)
     else:
         # If the gold solution is not parseable, we reward 1 to skip this example
@@ -143,6 +142,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--log_file", type=str, default="remote_rm.log", help="Log file path")
     args = parser.parse_args()
+    if os.path.exists(args.log_file):
+        os.remove(args.log_file)
     logger.remove()
     logger.add(args.log_file)
     # Split dataset paths and load all datasets

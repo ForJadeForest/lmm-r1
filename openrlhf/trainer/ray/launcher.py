@@ -8,6 +8,7 @@ import torch
 import torch.distributed as dist
 from ray.util.placement_group import PlacementGroup, placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from tqdm import tqdm
 
 from openrlhf.models import Actor, get_llm_for_sequence_regression
 from openrlhf.trainer.ray.utils import ray_noset_visible_devices
@@ -83,7 +84,7 @@ class BasePPORole(DistributedTorchRayActor):
                 raise ValueError(f"Parameter {param_name} has length {len(param_value)}, expected {list_length}")
 
         results = []
-        for i in range(list_length):
+        for i in tqdm(range(list_length), desc="Inference", disable=not self.strategy.is_rank_0()):
             # Create kwargs for single item
             sample_kwargs = {param_name: param_value[i] for param_name, param_value in kwargs.items()}
 
@@ -118,10 +119,9 @@ class ReferenceModelRayActor(BasePPORole):
     def forward(
         self,
         sequences: torch.LongTensor,
-        num_actions: int = None,
+        action_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         return_output=False,
-        logps_allgather=False,
         packed_seq_lens: Optional[list[int]] = None,
         visual_inputs: Optional[dict] = None,
     ) -> torch.Tensor:
@@ -132,11 +132,9 @@ class ReferenceModelRayActor(BasePPORole):
             visual_inputs = {k:v.to(device) for k,v in visual_inputs.items()}
             log_probs = self.model(
                 sequences.to(device),
-                num_actions,
+                action_mask.to(device),
                 attention_mask.to(device),
-                return_output=return_output,
                 ring_attn_group=self.strategy.ring_attn_group,
-                logps_allgather=logps_allgather,
                 packed_seq_lens=packed_seq_lens,
                 visual_inputs=visual_inputs,
             )
