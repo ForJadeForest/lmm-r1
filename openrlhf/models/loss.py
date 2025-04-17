@@ -393,6 +393,7 @@ class EntropyRegularizationLoss(nn.Module):
         # Return negative entropy (since we're minimizing)
         return -self.current_coef * entropy
     
+    @torch.no_grad()
     def get_entropy(
         self,
         action_log_probs: torch.Tensor,

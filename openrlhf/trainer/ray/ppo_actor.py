@@ -196,11 +196,6 @@ class ActorPPOTrainer(BasePPOTrainer):
         max_steps = args.max_global_steps
         
         while steps <= args.max_global_steps:
-            # Update entropy regularization coefficient
-            if self.entropy_loss is not None:
-                progress = float(steps) / max_steps
-                self.entropy_loss.update_coef(progress)
-
             if isinstance(self.prompts_dataloader.sampler, DistributedSampler):
                 self.prompts_dataloader.sampler.set_epoch(
                     episode, consumed_samples=0 if episode > start_episode else consumed_samples
@@ -243,6 +238,10 @@ class ActorPPOTrainer(BasePPOTrainer):
 
                 pbar.update()
                 steps = steps + 1
+                # Update entropy regularization coefficient
+                if self.entropy_loss is not None:
+                    progress = float(steps - 1) / max_steps
+                    self.entropy_loss.update_coef(progress)
 
             episode = episode + 1
             pbar.set_description(f"Steps [Episode {episode+1}]")
@@ -529,8 +528,8 @@ class ActorPPOTrainer(BasePPOTrainer):
             status["entropy_reg_loss"] = entropy_reg_loss.item()
             status["entropy_coef"] = self.entropy_loss.current_coef
         # entropy value: (Bs, )
-        entropy_value = self.entropy_loss.get_entropy(action_log_probs, experience.action_mask)
-        status["entropy"] = entropy_value
+        entropy_value = self.entropy_loss.get_entropy(action_log_probs, experience.action_mask).to(experience.info["response_length"].device)
+        status["entropy"] = (entropy_value * experience.info["response_length"]).sum() / experience.info["response_length"].sum()
 
         if self.pretrain_dataloader is not None:
             status["ptx_loss"] = ptx_loss.item()
