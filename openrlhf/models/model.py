@@ -12,6 +12,7 @@ from openrlhf.utils.logging_utils import init_logger
 
 from .ring_attn_utils import set_hacked_position_ids, clear_hacked_position_ids
 from openrlhf.models.lmm_kits.utils import get_generation_cls, smart_load_config
+from openrlhf.models.lmm_kits.base.data_processor import MMInputs
 from .ring_attn_utils import gather_and_pad_tensor, unpad_and_slice_tensor
 
 logger = init_logger(__name__)
@@ -192,16 +193,14 @@ def _get_reward_model(base_llm_model, value_head_prefix="score", packing_samples
             ring_attn_group=None,
             pad_sequence=False,
             packed_seq_lens=None,
-            visual_inputs=None,
+            visual_inputs: Optional[MMInputs] = None,
         ) -> torch.Tensor:
-            if visual_inputs is None:
-                visual_inputs = {}
-            inputs_embeds = super().get_inputs_embeds(input_ids, **visual_inputs)
+            inputs_embeds = super().get_inputs_embeds(input_ids, **visual_inputs.emb_inputs)
             batch, seqlen = input_ids.size()
             eos_indices = attention_mask.size(1) - 1 - attention_mask.long().fliplr().argmax(dim=1, keepdim=True)
             forward_attention_mask = attention_mask
             if self.packing_samples:
-                packed_position_ids = super().get_position_ids(input_ids,attention_mask=attention_mask,packing=True, **visual_inputs)
+                packed_position_ids = super().get_position_ids(input_ids,attention_mask=attention_mask,packing=True, **visual_inputs.emb_inputs)
                 input_ids, hacked_position_ids, _, ring_attn_pad_len, indices, inputs_embeds, split_position_ids = unpad_and_slice_tensor(
                     input_ids, attention_mask, ring_attn_group, inputs_embeds, packed_position_ids
                 )
@@ -211,10 +210,10 @@ def _get_reward_model(base_llm_model, value_head_prefix="score", packing_samples
                 forward_attention_mask = None
             else:
                 # https://github.com/OpenRLHF/OpenRLHF/issues/217
-                position_ids = super().get_position_ids(input_ids,attention_mask=attention_mask,packing=False, **visual_inputs)
+                position_ids = super().get_position_ids(input_ids,attention_mask=attention_mask,packing=False, **visual_inputs.emb_inputs)
 
             outputs = super().forward(
-                inputs_embeds=inputs_embeds, attention_mask=forward_attention_mask, position_ids=position_ids,output_hidden_states=True, **visual_inputs
+                inputs_embeds=inputs_embeds, attention_mask=forward_attention_mask, position_ids=position_ids,output_hidden_states=True, **visual_inputs.forward_inputs
             )
             clear_hacked_position_ids()
             if "last_hidden_state" in outputs:
@@ -269,13 +268,13 @@ def _get_critic_model(base_llm_model, value_head_prefix="score", packing_samples
             ring_attn_group=None,
             values_allgather=False,
             packed_seq_lens=None,
-            visual_inputs={},
+            visual_inputs: Optional[MMInputs] = None,
         ) -> torch.Tensor:
-            inputs_embeds = super().get_inputs_embeds(input_ids, **visual_inputs)
+            inputs_embeds = super().get_inputs_embeds(input_ids, **visual_inputs.emb_inputs)
             batch, seqlen = input_ids.size()
             forward_attention_mask = attention_mask
             if self.packing_samples:
-                packed_position_ids = super().get_position_ids(input_ids,attention_mask=attention_mask,packing=True, **visual_inputs)
+                packed_position_ids = super().get_position_ids(input_ids,attention_mask=attention_mask,packing=True, **visual_inputs.emb_inputs)
                 input_ids, hacked_position_ids, _, ring_attn_pad_len, indices, inputs_embeds, split_position_ids = unpad_and_slice_tensor(
                     input_ids, attention_mask, ring_attn_group, inputs_embeds, packed_position_ids
                 )
@@ -285,10 +284,10 @@ def _get_critic_model(base_llm_model, value_head_prefix="score", packing_samples
                 forward_attention_mask = None
             else:
                 # https://github.com/OpenRLHF/OpenRLHF/issues/217
-                position_ids = super().get_position_ids(input_ids,attention_mask=attention_mask,packing=False, **visual_inputs)
+                position_ids = super().get_position_ids(input_ids,attention_mask=attention_mask,packing=False, **visual_inputs.emb_inputs)
 
             outputs = super().forward(
-                inputs_embeds=inputs_embeds, attention_mask=forward_attention_mask, position_ids=position_ids,output_hidden_states=True, **visual_inputs
+                inputs_embeds=inputs_embeds, attention_mask=forward_attention_mask, position_ids=position_ids,output_hidden_states=True, **visual_inputs.forward_inputs
             )
             clear_hacked_position_ids()
 

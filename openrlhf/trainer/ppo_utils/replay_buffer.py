@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 
 from .experience_maker import Experience
-from openrlhf.models.lmm_kits.base.data_processor import BaseDataProcessor
+from openrlhf.models.lmm_kits.base.data_processor import BaseDataProcessor, MMInputs
 
 @dataclass
 class BufferItem:
@@ -36,7 +36,7 @@ class BufferItem:
     attention_mask: Optional[torch.LongTensor]
     action_mask: Optional[torch.BoolTensor]
     info: Optional[dict]
-    visual_inputs: Optional[dict]
+    visual_inputs: Optional[MMInputs]
 
 
 def split_experience_batch(experience: Experience, data_processor: Optional[BaseDataProcessor]) -> List[BufferItem]:
@@ -66,10 +66,9 @@ def split_experience_batch(experience: Experience, data_processor: Optional[Base
             batch_kwargs[i][key] = v
     
     visual_inputs_batch = experience.visual_inputs
-    visual_inputs_batch['input_ids'] = experience.sequences
+    visual_inputs_batch.extra_info['input_ids'] = experience.sequences
     visual_inputs_chunks = data_processor.split_input_batch(visual_inputs_batch)
     for i, visual_inputs in enumerate(visual_inputs_chunks):
-        visual_inputs.pop('input_ids')
         batch_kwargs[i]["visual_inputs"] = visual_inputs
 
 

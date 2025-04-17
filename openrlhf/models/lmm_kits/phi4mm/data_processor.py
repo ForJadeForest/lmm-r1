@@ -1,7 +1,6 @@
 from typing import List, Dict, Union
-from ..base.data_processor import BaseDataProcessor
+from ..base.data_processor import BaseDataProcessor, MMInputs
 import torch
-import os
 
 class Phi4MMDataProcessor(BaseDataProcessor):
     def __call__(
@@ -13,7 +12,7 @@ class Phi4MMDataProcessor(BaseDataProcessor):
         return_tensors="pt",
         add_special_tokens=False,
         truncation=True,
-    ):
+    ) -> MMInputs:
         texts = self.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image_inputs = self.get_images_from_messages(messages)
         # currently only support image and text
@@ -25,9 +24,19 @@ class Phi4MMDataProcessor(BaseDataProcessor):
             truncation=truncation,
             return_tensors=return_tensors,
         )
-        if device:
-            return {k: v.to(device) for k, v in batch.items() if v is not None and v.numel() > 0}
-        return batch
+        emb_inputs, extra_info, forward_inputs = self._split_input_dict(batch)
+        return MMInputs(emb_inputs=emb_inputs,extra_info=extra_info,forward_inputs=forward_inputs).to(device)
+
+    def _split_input_dict(self, input_dict: Dict) -> tuple[Dict, Dict, Dict]:
+        extra_info = {}
+        if "input_ids" in input_dict:
+            extra_info["input_ids"] = input_dict.pop("input_ids")
+        if "attention_mask" in input_dict:
+            extra_info["attention_mask"] = input_dict.pop("attention_mask")
+        forward_inputs = {}
+        if "input_mode" in input_dict:
+            forward_inputs["input_mode"] = input_dict.pop("input_mode")
+        return input_dict, extra_info, forward_inputs
     
     def apply_chat_template(
         self,
@@ -69,7 +78,7 @@ class Phi4MMDataProcessor(BaseDataProcessor):
             converted_messages.append(new_message)
         return converted_messages
 
-    def make_input_batch(self, inputs: List[Dict]) -> Dict:
+    def make_input_batch(self, inputs: List[MMInputs]) -> MMInputs:
         # each element has no batch dimension
         batch = {}
         # collect all keys
@@ -105,9 +114,10 @@ class Phi4MMDataProcessor(BaseDataProcessor):
                 # concat all items in a batch in the first dimension
                 batch[k] = torch.cat([inp[k] for inp in inputs if k in inp], dim=0)
 
-        return batch
+        emb_inputs, extra_info, forward_inputs = self._split_input_dict(batch)
+        return MMInputs(emb_inputs=emb_inputs,extra_info=extra_info,forward_inputs=forward_inputs)
     
-    def split_input_batch(self, batch: Dict) -> List[Dict]:
+    def split_input_batch(self, batch: MMInputs) -> List[MMInputs]:
         batch_size = len(batch["input_ids"])
         batch_kwargs = [{} for _ in range(batch_size)]
         # first process None values
@@ -184,7 +194,11 @@ class Phi4MMDataProcessor(BaseDataProcessor):
             assert len(image_attention_mask) == 0
             assert len(num_img_tokens) == 0
 
-        return batch_kwargs
+        mm_inputs_list = []
+        for b in batch_kwargs:
+            emb_inputs, extra_info, forward_inputs = self._split_input_dict(b)
+            mm_inputs_list.append(MMInputs(emb_inputs=emb_inputs,extra_info=extra_info,forward_inputs=forward_inputs))
+        return mm_inputs_list
 
 DataProcessor = Phi4MMDataProcessor
 

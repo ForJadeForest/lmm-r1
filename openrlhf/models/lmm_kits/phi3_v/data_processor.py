@@ -1,7 +1,6 @@
 from typing import List, Dict, Union
-from ..base.data_processor import BaseDataProcessor
+from ..base.data_processor import BaseDataProcessor, MMInputs
 import torch
-import os
 
 class Phi3_VDataProcessor(BaseDataProcessor):
     def __call__(
@@ -13,7 +12,7 @@ class Phi3_VDataProcessor(BaseDataProcessor):
         return_tensors="pt",
         add_special_tokens=False,
         truncation=True,
-    ):
+    ) -> MMInputs:
         texts = self.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image_inputs = self.get_images_from_messages(messages)
         batch = self.processor(
@@ -24,10 +23,17 @@ class Phi3_VDataProcessor(BaseDataProcessor):
             truncation=truncation,
             return_tensors=return_tensors,
         )
-        if device:
-            return {k: v.to(device) for k, v in batch.items()}
-        return batch
+        emb_inputs, extra_info = self._split_input_dict(batch)
+        return MMInputs(emb_inputs=emb_inputs,extra_info=extra_info).to(device)
     
+    def _split_input_dict(self, input_dict: Dict) -> tuple[Dict, Dict]:
+        extra_info = {}
+        if "input_ids" in input_dict:
+            extra_info["input_ids"] = input_dict.pop("input_ids")
+        if "attention_mask" in input_dict:
+            extra_info["attention_mask"] = input_dict.pop("attention_mask")
+        return input_dict, extra_info
+
     def apply_chat_template(
         self,
         messages: Union[Dict, List[str], str],
@@ -68,7 +74,7 @@ class Phi3_VDataProcessor(BaseDataProcessor):
             converted_messages.append(new_message)
         return converted_messages
 
-    def make_input_batch(self, inputs: List[Dict]) -> Dict:
+    def make_input_batch(self, inputs: List[MMInputs]) -> MMInputs:
         # each element has no batch dimension
         batch = {}
         # collect all keys
@@ -83,9 +89,10 @@ class Phi3_VDataProcessor(BaseDataProcessor):
                 batch[k] = torch.cat([inp[k] for inp in inputs if k in inp], dim=0)
             else:
                 raise ValueError(f"Unknown key {k} for Phi3_VDataProcessor")
-        return batch
+        emb_inputs, extra_info = self._split_input_dict(batch)
+        return MMInputs(emb_inputs=emb_inputs,extra_info=extra_info)
     
-    def split_input_batch(self, batch: Dict) -> List[Dict]:
+    def split_input_batch(self, batch: MMInputs) -> List[MMInputs]:
         batch_size = len(batch["input_ids"])
         batch_kwargs = [{} for _ in range(batch_size)]
         # first process None values
@@ -143,8 +150,11 @@ class Phi3_VDataProcessor(BaseDataProcessor):
                 batch_kwargs[i]["image_sizes"] = torch.stack(image_sizes_i, dim=0)
             assert len(image_sizes) == 0
             assert len(pixel_values) == 0
-
-        return batch_kwargs
+        mm_inputs_list = []
+        for b in batch_kwargs:
+            emb_inputs, extra_info = self._split_input_dict(b)
+            mm_inputs_list.append(MMInputs(emb_inputs=emb_inputs,extra_info=extra_info))
+        return mm_inputs_list
 
 DataProcessor = Phi3_VDataProcessor
 

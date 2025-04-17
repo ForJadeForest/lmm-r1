@@ -12,7 +12,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from openrlhf.models.actor import Actor
-from openrlhf.models.lmm_kits.base.data_processor import BaseDataProcessor
+from openrlhf.models.lmm_kits.base.data_processor import BaseDataProcessor, MMInputs
 from openrlhf.models.utils import compute_approx_kl, compute_reward, masked_mean
 from openrlhf.utils.distributed_util import torch_dist_barrier_and_cuda_sync
 from openrlhf.utils.logging_utils import init_logger
@@ -63,7 +63,7 @@ class Experience:
     action_mask: Optional[torch.BoolTensor]
     info: Optional[dict]
     kl: Optional[torch.Tensor] = None
-    visual_inputs: Optional[dict] = field(default_factory=dict)
+    visual_inputs: Optional[MMInputs] = field(default_factory=MMInputs)
 
     @torch.no_grad()
     def to_device(self, device: torch.device):
@@ -77,8 +77,7 @@ class Experience:
         self.action_mask = to(self.action_mask, device)
         self.kl = to(self.kl, device)
         self.info = {key: to(value, device) for key, value in self.info.items()}
-        if self.visual_inputs is not None:
-            self.visual_inputs = {key: to(value, device) for key, value in self.visual_inputs.items()}
+        self.visual_inputs = self.visual_inputs.to(device)
         return self
 
     def pin_memory(self):
@@ -92,8 +91,7 @@ class Experience:
         self.action_mask = pin_memory(self.action_mask)
         self.kl = pin_memory(self.kl)
         self.info = {key: pin_memory(value) for key, value in self.info.items()}
-        if self.visual_inputs is not None:
-            self.visual_inputs = {key: pin_memory(value) for key, value in self.visual_inputs.items()}
+        self.visual_inputs = self.visual_inputs.pin_memory()
         return self
 
 
@@ -126,7 +124,7 @@ class Samples:
     response_length: torch.Tensor
     total_length: torch.Tensor
     prompts: list[str]
-    visual_inputs: Optional[list[Dict]]
+    visual_inputs: list[MMInputs]
     labels: list[str]
 
     def __init__(
@@ -335,7 +333,7 @@ class RemoteExperienceMaker(BaseExperienceMaker):
         attention_mask_cpu_list = [mask.to("cpu") for mask in attention_mask_list]
         visual_inputs_cpu_list = None
         if visual_inputs_list is not None:
-            visual_inputs_cpu_list = [{k: v.to("cpu") for k, v in visual_inputs.items()} for visual_inputs in visual_inputs_list]
+            visual_inputs_cpu_list = [visual_inputs.to("cpu") for visual_inputs in visual_inputs_list]
 
         # Batch call initial model
         if self.initial_model is not None:
@@ -401,13 +399,12 @@ class RemoteExperienceMaker(BaseExperienceMaker):
         # Batch call actor model
         action_log_probs_list = []
         for seq, action_mask, attn_mask, visual_inputs in zip(sequences_cpu_list, action_mask_list, attention_mask_cpu_list, visual_inputs_cpu_list):
-            visual_inputs = None if visual_inputs is None else {k: v.to(device) for k, v in visual_inputs.items()}
             action_log_probs = self.actor(
                 seq.to(device),
                 action_mask,
                 attn_mask.to(device),
                 ring_attn_group=self.strategy.ring_attn_group,
-                visual_inputs=visual_inputs,
+                visual_inputs=visual_inputs.to(device),
             )
             action_log_probs_list.append(action_log_probs)
 
@@ -699,18 +696,11 @@ class RemoteExperienceMaker(BaseExperienceMaker):
         for i in range(0, len(all_prompts), args.micro_rollout_batch_size):
             prompts = all_prompts[i : i + args.micro_rollout_batch_size]
             inputs = self.data_processor(prompts, self.prompt_max_len, device="cuda")
-            visual_inputs = {}
-            for k,v in inputs.items():
-                if k not in ["attention_mask"]:
-                    visual_inputs[k] = v
             sequences, attention_mask, action_mask = self.actor.generate(**inputs, **generate_kwargs)
             rollout_sequences.append(sequences)
             rollout_attention_mask.append(attention_mask)
             rollout_action_mask.append(action_mask)
-            rollout_visual_inputs_chunks = self.data_processor.split_input_batch(visual_inputs)
-            for visual_inputs_chunk in rollout_visual_inputs_chunks:
-                visual_inputs_chunk.pop("input_ids")
-                rollout_visual_inputs.append(visual_inputs_chunk)
+            rollout_visual_inputs.extend(self.data_processor.split_input_batch(inputs))
         rollout_sequences = torch.cat(rollout_sequences, dim=0)
         rollout_attention_mask = torch.cat(rollout_attention_mask, dim=0)
         rollout_action_mask = torch.cat(rollout_action_mask, dim=0)
@@ -829,13 +819,7 @@ class RemoteExperienceMaker(BaseExperienceMaker):
         total_length = attention_mask.float().sum(dim=-1)
 
         visual_inputs = self.data_processor(all_prompts, self.prompt_max_len, device="cuda")
-        visual_inputs_chunks = self.data_processor.split_input_batch(visual_inputs)
-        visual_inputs = []
-        for visual_inputs_chunk in visual_inputs_chunks:
-            visual_inputs_chunk.pop("input_ids")
-            visual_inputs_chunk.pop("attention_mask")
-            visual_inputs_chunk = {k: v.to("cuda") for k, v in visual_inputs_chunk.items()}
-            visual_inputs.append(visual_inputs_chunk)
+        visual_inputs = self.data_processor.split_input_batch(visual_inputs)
         rollout_samples = Samples(
             sequences=sequences,
             attention_mask=attention_mask,

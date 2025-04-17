@@ -13,6 +13,7 @@ from tqdm import tqdm
 from openrlhf.models import Actor, get_llm_for_sequence_regression
 from openrlhf.trainer.ray.utils import ray_noset_visible_devices
 from openrlhf.utils.deepspeed import DeepspeedStrategy
+from openrlhf.models.lmm_kits.base.data_processor import MMInputs
 
 
 class DistributedTorchRayActor:
@@ -123,20 +124,17 @@ class ReferenceModelRayActor(BasePPORole):
         attention_mask: Optional[torch.Tensor] = None,
         return_output=False,
         packed_seq_lens: Optional[list[int]] = None,
-        visual_inputs: Optional[dict] = None,
+        visual_inputs: Optional[MMInputs] = None,
     ) -> torch.Tensor:
-        if visual_inputs is None:
-            visual_inputs = {}
         device = torch.cuda.current_device()
         with torch.no_grad():
-            visual_inputs = {k:v.to(device) for k,v in visual_inputs.items()}
             log_probs = self.model(
                 sequences.to(device),
                 action_mask.to(device),
                 attention_mask.to(device),
                 ring_attn_group=self.strategy.ring_attn_group,
                 packed_seq_lens=packed_seq_lens,
-                visual_inputs=visual_inputs,
+                visual_inputs=visual_inputs.to(device),
             )
         return log_probs.to("cpu")
 
@@ -176,12 +174,9 @@ class RewardModelRayActor(BasePPORole):
         attention_mask: Optional[torch.Tensor] = None,
         packed_seq_lens=None,
         pad_sequence=False,
-        visual_inputs: Optional[dict] = None,
+        visual_inputs: Optional[MMInputs] = None,
     ) -> torch.Tensor:
         device = torch.cuda.current_device()
-        if visual_inputs is None:
-            visual_inputs = {}
-        visual_inputs = {k:v.to(device) for k,v in visual_inputs.items()}
         with torch.no_grad():
             reward = self.model(
                 sequences.to(device),
@@ -189,7 +184,7 @@ class RewardModelRayActor(BasePPORole):
                 ring_attn_group=self.strategy.ring_attn_group,
                 pad_sequence=True,
                 packed_seq_lens=packed_seq_lens,
-                visual_inputs=visual_inputs,
+                visual_inputs=visual_inputs.to(device),
             )
         return reward.to("cpu")
 

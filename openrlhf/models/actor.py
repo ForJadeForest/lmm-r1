@@ -11,6 +11,7 @@ from transformers.integrations.deepspeed import HfDeepSpeedConfig
 from .ring_attn_utils import set_hacked_position_ids, clear_hacked_position_ids
 from .utils import log_probs_from_logits
 from openrlhf.models.lmm_kits.utils import get_generation_cls, hack_peft_model, smart_load_config
+from openrlhf.models.lmm_kits.base.data_processor import MMInputs
 from .ring_attn_utils import gather_and_pad_tensor, unpad_and_slice_tensor
 
 
@@ -222,17 +223,15 @@ class Actor(nn.Module):
         return_logprobs=False,
         ring_attn_group: Optional[dist.ProcessGroup] = None,
         packed_seq_lens: Optional[list[int]] = None,
-        visual_inputs: Optional[dict] = None,
+        visual_inputs: Optional[MMInputs] = None,
     ) -> torch.Tensor:
         """Returns action log probs"""
-        if visual_inputs is None:
-            visual_inputs = {}
 
-        inputs_embeds = self.model.get_inputs_embeds(sequences, **visual_inputs)
+        inputs_embeds = self.model.get_inputs_embeds(sequences, **visual_inputs.emb_inputs)
         batch, seqlen = sequences.size()
         foward_attention_mask = attention_mask
         if self.packing_samples:
-            packed_position_ids = self.model.get_position_ids(sequences, attention_mask=attention_mask, packing=True, **visual_inputs)
+            packed_position_ids = self.model.get_position_ids(sequences, attention_mask=attention_mask, packing=True, **visual_inputs.emb_inputs)
             sequences, hacked_position_ids, rolled_sequences, ring_attn_pad_len, indices, inputs_embeds, split_position_ids = unpad_and_slice_tensor(
                 sequences, attention_mask, ring_attn_group, inputs_embeds, packed_position_ids
             )
@@ -243,9 +242,9 @@ class Actor(nn.Module):
         else:
             # https://github.com/OpenRLHF/OpenRLHF/issues/217
             rolled_sequences = torch.roll(sequences, shifts=-1, dims=1)
-            position_ids = self.model.get_position_ids(sequences, attention_mask=attention_mask, packing=False, **visual_inputs)
+            position_ids = self.model.get_position_ids(sequences, attention_mask=attention_mask, packing=False, **visual_inputs.emb_inputs)
 
-        output = self.model(inputs_embeds=inputs_embeds, attention_mask=foward_attention_mask, position_ids=position_ids, **visual_inputs)
+        output = self.model(inputs_embeds=inputs_embeds, attention_mask=foward_attention_mask, position_ids=position_ids, **visual_inputs.forward_inputs)
         clear_hacked_position_ids()
         # https://github.com/OpenRLHF/OpenRLHF/pull/634
         output["logits"] = output["logits"].to(torch.float32)

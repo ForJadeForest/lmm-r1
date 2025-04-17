@@ -1,10 +1,8 @@
-import os
 from typing import List, Dict
 
 import torch
 from qwen_vl_utils import process_vision_info
-
-from ..base.data_processor import BaseDataProcessor
+from ..base.data_processor import BaseDataProcessor, MMInputs
 
 
 class Qwen2_5_VLDataProcessor(BaseDataProcessor):
@@ -17,7 +15,7 @@ class Qwen2_5_VLDataProcessor(BaseDataProcessor):
         return_tensors="pt",
         add_special_tokens=False,
         truncation=True,
-    ) -> Dict:
+    ) -> MMInputs:
         messages = self._format_messages(messages)
         processor = self.processor
         texts = processor.apply_chat_template(
@@ -35,11 +33,18 @@ class Qwen2_5_VLDataProcessor(BaseDataProcessor):
             truncation=truncation,
             return_tensors=return_tensors,
         )
-        if device:
-            return {k: v.to(device) for k, v in batch.items()}
-        return {k: v for k, v in batch.items()}
+        emb_inputs, extra_info = self._split_input_dict(batch)
+        return MMInputs(emb_inputs=emb_inputs,extra_info=extra_info).to(device)
+    
+    def _split_input_dict(self, input_dict: Dict) -> tuple[Dict, Dict]:
+        extra_info = {}
+        if "input_ids" in input_dict:
+            extra_info["input_ids"] = input_dict.pop("input_ids")
+        if "attention_mask" in input_dict:
+            extra_info["attention_mask"] = input_dict.pop("attention_mask")
+        return input_dict, extra_info
 
-    def make_input_batch(self, inputs: List[Dict]) -> Dict:
+    def make_input_batch(self, inputs: List[MMInputs]) -> MMInputs:
         # each element has no batch dimension
         batch = {}
         # collect all keys
@@ -53,9 +58,11 @@ class Qwen2_5_VLDataProcessor(BaseDataProcessor):
                 batch[k] = torch.cat([inp[k] for inp in inputs if k in inp], dim=0)
             else:
                 raise ValueError(f"Unknown key {k} for Qwen2VLDataProcessor")
-        return batch
 
-    def split_input_batch(self, batch: Dict) -> List[Dict]:
+        emb_inputs, extra_info = self._split_input_dict(batch)
+        return MMInputs(emb_inputs=emb_inputs,extra_info=extra_info)
+
+    def split_input_batch(self, batch: MMInputs) -> List[MMInputs]:
         batch_size = len(batch["input_ids"])
         batch_kwargs = [{} for _ in range(batch_size)]
         # first process None values
@@ -113,7 +120,11 @@ class Qwen2_5_VLDataProcessor(BaseDataProcessor):
                 batch_kwargs[i]["pixel_values"] = pixel_values_i
             assert len(thws) == 0
             assert len(pixel_values) == 0
-        return batch_kwargs
+        mm_inputs_list = []
+        for b in batch_kwargs:
+            emb_inputs, extra_info = self._split_input_dict(b)
+            mm_inputs_list.append(MMInputs(emb_inputs=emb_inputs,extra_info=extra_info))
+        return mm_inputs_list
     
 DataProcessor = Qwen2_5_VLDataProcessor
 

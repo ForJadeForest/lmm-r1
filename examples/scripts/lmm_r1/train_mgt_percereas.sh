@@ -67,7 +67,7 @@ REMOTE_RM_PID=$!
 # Start training
 echo "Starting training..."
 ray job submit --address="http://127.0.0.1:8265" \
-   --runtime-env-json="{\"working_dir\": \"${WORKSPACE_DIR}\"}" \
+   --runtime-env-json="{\"working_dir\": \"${WORKSPACE_DIR}\",\"env_vars\":{\"VLLM_USE_V1\":\"1\",\"VLLM_ENABLE_V1_MULTIPROCESSING\":\"0\"}}" \
    -- python -m openrlhf.cli.train_ppo_ray \
    --ref_num_nodes 1 \
    --ref_num_gpus_per_node 8 \

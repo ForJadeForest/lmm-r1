@@ -90,7 +90,7 @@ class LLMRayActor:
         if self.actor_counter == self.num_actors:
             assert len(self.requests) == self.num_actors
             num_requests = []
-            requests: list[TokensPrompt] = []
+            requests = []
             for actor_rank, request in self.requests.items():
                 num_requests.append((actor_rank, len(request)))
                 requests.extend(request)

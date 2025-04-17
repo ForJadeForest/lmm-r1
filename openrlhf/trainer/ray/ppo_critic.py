@@ -13,6 +13,7 @@ from openrlhf.models.utils import masked_mean
 from openrlhf.trainer import BasePPOTrainer
 from openrlhf.trainer.ppo_utils import Experience
 from openrlhf.models.lmm_kits.utils import get_data_processor
+from openrlhf.models.lmm_kits.base.data_processor import MMInputs
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.utils.deepspeed.deepspeed_utils import offload_deepspeed_states, reload_deepspeed_states
 
@@ -200,15 +201,12 @@ class CriticModelRayActor(BasePPORole):
         action_mask: Optional[Union[int, list[int]]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         packed_seq_lens=None,
-        visual_inputs=None,
+        visual_inputs: Optional[MMInputs] = None,
     ) -> torch.Tensor:
         """Generates critic values."""
         device = torch.cuda.current_device()
         self.critic.eval()
-        if visual_inputs is None:
-            visual_inputs = {}
         with torch.no_grad():
-            visual_inputs = {k: v.to(device) for k, v in visual_inputs.items()}
             value = self.critic(
                 sequences.to(device),
                 action_mask.to(device),
@@ -216,7 +214,7 @@ class CriticModelRayActor(BasePPORole):
                 ring_attn_group=self.strategy.ring_attn_group,
                 values_allgather=True,
                 packed_seq_lens=packed_seq_lens,
-                visual_inputs=visual_inputs,
+                visual_inputs=visual_inputs.to(device),
             )
         self.critic.train()  # reset model state
         return value.to("cpu")
