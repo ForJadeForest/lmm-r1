@@ -350,6 +350,11 @@ class DeepspeedStrategy(ABC):
                   and "model.vision_embed_tokens.wte.weight" in state_dict_keys:
                 state_dict_keys.remove("model.vision_embed_tokens.wte.weight")
 
+            # corner case for gemma3
+            if getattr(model_to_save.config, "model_type", None) == "gemma3" \
+                and "language_model.lm_head.weight" in state_dict_keys:
+                state_dict_keys.remove("language_model.lm_head.weight")
+
             assert state_dict_keys.issubset(
                 output_state_dict_keys
             ), f"mismatch keys {output_state_dict_keys.symmetric_difference(state_dict_keys)}"
