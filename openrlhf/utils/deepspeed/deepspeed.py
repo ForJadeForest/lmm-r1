@@ -220,6 +220,7 @@ class DeepspeedStrategy(ABC):
             config=ds_config,
             args={"local_rank": int(os.environ.get("LOCAL_RANK", "-1"))},
             dist_init_required=True,
+            model_parameters=filter(lambda p: p.requires_grad, model.parameters()),
         )
         if self.torch_compile:
             engine.compile()
