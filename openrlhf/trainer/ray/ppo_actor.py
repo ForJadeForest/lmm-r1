@@ -500,7 +500,7 @@ class ActorPPOTrainer(BasePPOTrainer):
         if self.pretrain_dataloader is not None:
             status["ptx_loss"] = ptx_loss.item()
         for k, v in experience.info.items():
-            if k in ["kl", "entropy"]:
+            if k == "kl":
                 status[k] = (
                     (v * experience.info["response_length"]).sum() / experience.info["response_length"].sum()
                 ).item()
