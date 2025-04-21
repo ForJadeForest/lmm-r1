@@ -15,6 +15,7 @@ from concurrent import futures
 app = Flask(__name__)
 
 problem_to_answer = {}
+enable_format_reward = True
 
 
 def get_response_from_query(q: str):
@@ -112,7 +113,12 @@ def get_reward():
         response = get_response_from_query(q) or q
         if response is None:
             return jsonify({"error": f"response not found from {q}"}), 400
-        format_reward = float(verify_format(response)) * 0.5
+        
+        # Apply format reward only if enabled
+        format_reward = 0.0
+        if enable_format_reward:
+            format_reward = float(verify_format(response)) * 0.5
+            
         acc_reward_future = math_verify_executor.submit(verify_math, response, answer)
        
         do_print = random.randint(1, 20) == 1
@@ -141,11 +147,21 @@ if __name__ == "__main__":
         "--input_key", type=str, default="prompt", help="The key name of prompt."
     )
     parser.add_argument("--log_file", type=str, default="remote_rm.log", help="Log file path")
+    parser.add_argument(
+        "--disable-format-reward", action="store_true", 
+        help="Disable format reward calculation. When enabled (default), responses get +0.5 reward for correct format."
+    )
     args = parser.parse_args()
     if os.path.exists(args.log_file):
         os.remove(args.log_file)
     logger.remove()
     logger.add(args.log_file)
+    
+    # Set format reward flag based on command line argument
+    enable_format_reward = not args.disable_format_reward
+    print(f"Format reward is {'disabled' if args.disable_format_reward else 'enabled'}")
+    logger.info(f"Format reward is {'disabled' if args.disable_format_reward else 'enabled'}")
+    
     # Split dataset paths and load all datasets
     dataset = []
     for dataset_path in args.dataset.split(','):
