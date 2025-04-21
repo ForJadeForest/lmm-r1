@@ -493,7 +493,9 @@ class ActorPPOTrainer(BasePPOTrainer):
             status["entropy_coef"] = self.entropy_loss.current_coef
         # entropy value: (Bs, )
         entropy_value = self.entropy_loss.get_entropy(action_log_probs, experience.action_mask).to(experience.info["response_length"].device)
-        status["entropy"] = (entropy_value * experience.info["response_length"]).sum() / experience.info["response_length"].sum()
+        status["entropy"] = (
+            (entropy_value * experience.info["response_length"]).sum() / experience.info["response_length"].sum()
+        ).item()
 
         if self.pretrain_dataloader is not None:
             status["ptx_loss"] = ptx_loss.item()
