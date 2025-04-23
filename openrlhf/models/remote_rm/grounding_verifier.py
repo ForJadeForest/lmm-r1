@@ -123,7 +123,7 @@ def verify_grounding(response, label, meta_info):
     Verify if the predicted bounding box has IoU > 0.5 with the ground truth.
     
     response: The model's response string
-    label: Ground truth bounding box [x1, y1, x2, y2] or [x1, y1, w, h]
+    label: Ground truth bounding box [x1, y1, x2, y2]
     meta_info: Dictionary containing resize information
     """
     # Extract JSON content from the response
@@ -131,27 +131,23 @@ def verify_grounding(response, label, meta_info):
     if not json_data:
         return 0.0
     
+    # Count number of bounding boxes in the prediction
+    bbox_count = sum(1 for pred in json_data if "bbox_2d" in pred)
+    
+    # If more than one bounding box is detected, return 0.0 reward
+    if bbox_count > 1:
+        logger.warning(f"Multiple bounding boxes detected ({bbox_count}). Returning 0.0 reward.")
+        return 0.0
+    
     # Get resized dimensions from meta_info
     resized_width, resized_height = meta_info["resized_img_size"]
     
-    # Convert ground truth from [x1, y1, w, h] to [x1, y1, x2, y2] for IoU calculation
+    # Parse the ground truth label
     # The ground truth is already in the original image coordinates
-    if len(label) == 4:
-        # Check if it's already in [x1, y1, x2, y2] format or [x, y, w, h] format
-        if label[2] < label[0] or label[3] < label[1]:
-            # Invalid box
-            logger.error(f"Invalid ground truth box: {label}")
-            return 0.0
-            
-        # If the width and height are small, it's likely in [x, y, w, h] format
-        if label[2] < 100 and label[3] < 100:
-            gt_bbox = [label[0], label[1], label[0] + label[2], label[1] + label[3]]
-        else:
-            # Already in [x1, y1, x2, y2] format
-            gt_bbox = label
-    else:
-        logger.error(f"Unexpected ground truth format: {label}")
-        return 0.0
+    gt_bbox = eval(label)
+    # Assert ground truth format is valid
+    assert len(gt_bbox) == 4, f"Unexpected ground truth format: {gt_bbox}"
+    assert gt_bbox[2] >= gt_bbox[0] and gt_bbox[3] >= gt_bbox[1], f"Invalid ground truth box: {gt_bbox}"
     
     # Go through each predicted box
     best_iou = 0.0
@@ -164,16 +160,12 @@ def verify_grounding(response, label, meta_info):
                 logger.warning(f"Skipping invalid bbox format: {pred_bbox}")
                 continue
                 
-            # Check if it's already in [x1, y1, x2, y2] format or [x, y, w, h] format
+            # Check if the box coordinates are valid
             if pred_bbox[2] < pred_bbox[0] or pred_bbox[3] < pred_bbox[1]:
                 # Invalid box, skip
                 logger.warning(f"Skipping invalid predicted box: {pred_bbox}")
                 continue
-                
-            # Convert to [x1, y1, x2, y2] format if needed
-            if pred_bbox[2] < 100 and pred_bbox[3] < 100:  # Likely [x, y, w, h]
-                pred_bbox = [pred_bbox[0], pred_bbox[1], pred_bbox[0] + pred_bbox[2], pred_bbox[1] + pred_bbox[3]]
-            
+
             # Adjust bbox to original image size
             adjusted_pred_bbox = adjust_bbox_to_original(pred_bbox, meta_info)
             
@@ -188,7 +180,6 @@ def verify_grounding(response, label, meta_info):
 def get_reward():
     # Get JSON data from request
     data = request.get_json()
-    
     # Check for required fields
     if "query" not in data or "prompts" not in data or "labels" not in data:
         return jsonify({"error": "query, prompts, and labels fields are required"}), 400
@@ -223,7 +214,7 @@ def get_reward():
             reward = verify_grounding(response, label, meta_info)
             
             # Randomly log some examples
-            if random.randint(1, 20) == 1:
+            if random.randint(1, 2) == 1:
                 info = f"Query: {q}\n\nPrompt: {prompt_str[:200]}...\n\nLabel: {label}\n\nResponse: {response}\n\nReward: {reward}\n\n"
                 info = re.sub(r"<\|.*?\|>", "", info)
                 logger.info(info)
@@ -282,7 +273,7 @@ if __name__ == "__main__":
     if os.path.exists(args.log_file):
         os.remove(args.log_file)
     logger.remove()
-    logger.add(args.log_file)
+    logger.add(args.log_file, level="DEBUG")
     
     # Load dataset and build lookup dictionary
     load_dataset(args.dataset)
