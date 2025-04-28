@@ -3,33 +3,31 @@ import itertools
 import math
 import os
 import socket
-import time
-from datetime import timedelta
-from typing import Callable, Dict, List
+from abc import ABC
+from typing import Dict, List, Optional, Union
 
 import deepspeed
 import ray
 import torch
 import torch.distributed
+from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers.trainer import get_scheduler
 
-from openrlhf.datasets import PromptDataset, SFTDataset
-from openrlhf.models import Actor
+from openrlhf.models import Actor, PolicyLoss
 from openrlhf.models.utils import compute_approx_kl, masked_mean
-from openrlhf.trainer import BasePPOTrainer
-from openrlhf.trainer.ppo_utils import Experience, RemoteExperienceMaker
-from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
-from openrlhf.utils import blending_datasets, get_tokenizer
+from openrlhf.trainer.ppo_utils.experience_maker import Experience
+from openrlhf.utils import get_tokenizer
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.utils.deepspeed.deepspeed_utils import offload_deepspeed_states, reload_deepspeed_states
-from openrlhf.utils.distributed_sampler import DistributedSampler
 from openrlhf.models.lmm_kits.utils import get_data_processor
+from openrlhf.models.lmm_kits.base.data_processor import MMInputs
 from peft.peft_model import PeftModel
 from openrlhf.utils.distributed_util import init_process_group, torch_dist_barrier_and_cuda_sync
 from openrlhf.utils.logging_utils import init_logger
-from openrlhf.utils.remote_rm_utils import remote_rm_fn_ray
+
+from ..ppo_utils import NaiveReplayBuffer
 
 logger = init_logger(__name__)
 
@@ -37,74 +35,55 @@ from .launcher import BasePPORole
 from .utils import get_physical_gpu_id
 
 
-class ActorPPOTrainer(BasePPOTrainer):
+class ActorPPOTrainer(ABC):
     def __init__(
         self,
-        *args,
+        strategy,
+        actor: Actor,
+        ema_model: Actor,
+        actor_optim: Optimizer,
+        actor_scheduler,
+        ema_beta: float = 0.992,
+        micro_train_batch_size: int = 8,
+        buffer_limit: int = 0,
+        buffer_cpu_offload: bool = True,
+        eps_clip: float = 0.2,
+        data_processor=None,
+        dataloader_pin_memory: bool = True,
         vllm_engines: List = None,
-        remote_rm_url: List[str] = None,
-        critic_train_remote: bool = False,
         **kwargs,
     ):
         """PPOTrainer for ray.
 
         Args:
             vllm_engines (List, optional): vllm engines for text generation, if not specified, generate text by actor model directly. Defaults to None.
-            critic_train_remote (bool, optional): whether this actor should triger corresponding critic model training. Defaults to False.
         """
-        super().__init__(*args, **kwargs)
-        self.remote_rm_url = remote_rm_url
+        self.strategy = strategy
+        self.args = strategy.args
+        self.data_processor = data_processor
+        self.tokenizer = data_processor.tokenizer
+        self.generate_kwargs = kwargs
+        self.dataloader_pin_memory = dataloader_pin_memory
+        self.micro_train_batch_size = micro_train_batch_size
+        self.ema_beta = ema_beta
+
+        self.actor = actor
+        self.ema_model = ema_model
+        self.actor_optim = actor_optim
+        self.actor_scheduler = actor_scheduler
         self.vllm_engines = vllm_engines
-        self.critic_train_remote = critic_train_remote
+        self.max_epochs = self.args.max_epochs
 
-        # wandb/tensorboard setting
-        self._wandb = None
-        self._tensorboard = None
-        if self.strategy.args.use_wandb and self.strategy.is_rank_0():
-            import wandb
+        self.actor_loss_fn = PolicyLoss(eps_clip)
 
-            self._wandb = wandb
-            if not wandb.api.api_key:
-                wandb.login(key=self.strategy.args.use_wandb)
-            wandb.init(
-                entity=self.strategy.args.wandb_org,
-                project=self.strategy.args.wandb_project,
-                group=self.strategy.args.wandb_group,
-                name=self.strategy.args.wandb_run_name,
-                config=self.strategy.args.__dict__,
-                reinit=True,
-            )
+        # Mixtral 8x7b
+        self.aux_loss = self.args.aux_loss_coef > 1e-8
 
-            wandb.define_metric("train/global_step")
-            wandb.define_metric("train/*", step_metric="train/global_step", step_sync=True)
-            wandb.define_metric("eval/epoch")
-            wandb.define_metric("eval/*", step_metric="eval/epoch", step_sync=True)
+        self.replay_buffer = NaiveReplayBuffer(
+            micro_train_batch_size, self.data_processor, buffer_limit, buffer_cpu_offload, getattr(self.args, "packing_samples", False), False
+        ) # Dynamic sampling is controlled by the single controller. We don't need to store extra buffers here.
 
-        # Initialize TensorBoard writer
-        if self.strategy.args.use_tensorboard and self.strategy.is_rank_0():
-            from torch.utils.tensorboard import SummaryWriter
-
-            os.makedirs(self.strategy.args.use_tensorboard, exist_ok=True)
-            log_dir = os.path.join(self.strategy.args.use_tensorboard, self.strategy.args.wandb_run_name)
-            self._tensorboard = SummaryWriter(log_dir=log_dir)
-
-        self.experience_maker = RemoteExperienceMaker(
-            self.actor,
-            self.critic,
-            self.reward_model,
-            self.initial_model,
-            self.tokenizer,
-            self.data_processor,
-            self.prompt_max_len,
-            self.kl_ctl,
-            self.strategy,
-            self.remote_rm_url,
-            self.reward_fn,
-            vllm_engines=self.vllm_engines,
-            packing_samples=self.strategy.args.packing_samples,
-            custom_experience_filter=self.custom_experience_filter,
-        )
-
+        # Init torch group for weights sync
         backend = getattr(self.strategy.args, "vllm_sync_backend", "nccl")
         self.use_cuda_ipc = False
         if backend == "nccl" and self.strategy.args.colocate_all_models:
@@ -167,153 +146,7 @@ class ActorPPOTrainer(BasePPOTrainer):
 
         torch_dist_barrier_and_cuda_sync()
 
-    def fit(
-        self,
-        args,
-        prompts_dataloader,
-        pretrain_dataloader,
-        eval_dataloader,
-        consumed_samples=0,
-        num_rollouts_per_episodes=1,
-        trained_steps=0,
-    ) -> None:
-
-        # get eval and save steps
-        if args.eval_steps == -1:
-            args.eval_steps = num_rollouts_per_episodes  # Evaluate once per epoch
-        if args.save_steps == -1:
-            args.save_steps = float("inf")  # do not save ckpt
-
-        self.prompts_dataloader = prompts_dataloader
-        self.pretrain_dataloader = pretrain_dataloader
-        self.replay_buffer.set_limit(prompts_dataloader.batch_size * args.n_samples_per_prompt)
-        self.eval_dataloader = eval_dataloader
-
-        # Restore step and start_epoch
-        steps = trained_steps + 1
-        total_consumed_samples = consumed_samples
-        start_episode = consumed_samples // args.rollout_batch_size // num_rollouts_per_episodes
-        consumed_samples = consumed_samples % (num_rollouts_per_episodes * args.rollout_batch_size)
-        episode = start_episode
-        pbar = tqdm(
-            range(args.max_global_steps),
-            desc=f"Steps [Episode {episode+1}]",
-            disable=not self.strategy.is_rank_0(),
-            initial=steps-1,
-        )
-        max_steps = args.max_global_steps
-        
-        while steps <= args.max_global_steps:
-            if isinstance(self.prompts_dataloader.sampler, DistributedSampler):
-                self.prompts_dataloader.sampler.set_epoch(
-                    episode, consumed_samples=0 if episode > start_episode else consumed_samples
-                )
-
-            for _, rand_prompts, labels in self.prompts_dataloader:
-                total_consumed_samples += len(rand_prompts)
-                for i, experience in enumerate(
-                    self.experience_maker.make_experience_list(rand_prompts, labels, **self.generate_kwargs)
-                ):
-                    if i == 0:
-                        output = self.tokenizer.batch_decode(
-                            experience.sequences[0].unsqueeze(0), skip_special_tokens=True
-                        )
-                        self.strategy.print(output)
-                    self.replay_buffer.append(experience)
-
-                replay_buffer_ready = self.replay_buffer.full()
-                replay_buffer_ready = self.strategy.all_gather(replay_buffer_ready)
-                if not replay_buffer_ready.all():
-                    print(f"Replay buffer space: {len(self.replay_buffer)}/{self.replay_buffer.limit}. Continue to sample more data.")
-                    continue
-
-                if self.args.advantage_estimator not in ["group_norm", "dr_grpo"]:
-                    self.replay_buffer.normalize(
-                        self.strategy, "advantages", divide_by_std=not self.args.no_advantage_std_norm
-                    )
-                status = self.ppo_train(steps)
-                self.replay_buffer.clear()
-                if args.store_extra_buffers:
-                    print(f"Replay buffer space: {len(self.replay_buffer)}/{self.replay_buffer.limit}. Stored buffers are used after clearing.")
-
-                if "kl" in status:
-                    self.kl_ctl.update(status["kl"], args.rollout_batch_size * args.n_samples_per_prompt)
-                pbar.set_postfix(status)
-
-                # logs/checkpoints
-                client_states = {"consumed_samples": total_consumed_samples, "trained_steps": steps}
-                self.save_logs_and_checkpoints(args, steps, pbar, status, client_states)
-
-                pbar.update()
-                steps = steps + 1
-                # Update entropy regularization coefficient
-                if self.entropy_loss is not None:
-                    progress = float(steps - 1) / max_steps
-                    self.entropy_loss.update_coef(progress)
-
-            episode = episode + 1
-            pbar.set_description(f"Steps [Episode {episode+1}]")
-
-        if self._wandb is not None and self.strategy.is_rank_0():
-            self._wandb.finish()
-        if self._tensorboard is not None and self.strategy.is_rank_0():
-            self._tensorboard.close()
-
-    def ppo_train(self, global_steps):
-        # 1. ensure all experience makers done
-        self.experience_maker.flush()
-        torch_dist_barrier_and_cuda_sync()
-        status = {}
-
-        # 2. triger remote critic model training
-        if self.critic_train_remote:
-            # sync for deepspeed_enable_sleep
-            if self.strategy.args.deepspeed_enable_sleep:
-                ray.get(self.critic.reload_states.remote())
-
-            critic_status_ref = self.critic.fit.remote()
-
-            if self.strategy.args.colocate_all_models or self.strategy.args.deepspeed_enable_sleep:
-                status.update(ray.get(critic_status_ref))
-            if self.strategy.args.deepspeed_enable_sleep:
-                ray.get(self.critic.offload_states.remote())
-
-        if self.strategy.args.colocate_all_models:
-            torch_dist_barrier_and_cuda_sync()
-
-        # 3. actor model training
-        if global_steps > self.freezing_actor_steps:
-            if self.strategy.args.deepspeed_enable_sleep:
-                self.reload_states()
-
-            status.update(self.ppo_train_actor(global_steps))
-
-            if self.strategy.args.deepspeed_enable_sleep:
-                self.offload_states()
-
-            torch.cuda.empty_cache()
-
-            # 4. broadcast weights to vllm engines
-            if self.vllm_engines is not None:
-                if self.strategy.args.vllm_enable_sleep:
-                    batch_vllm_engine_call(self.vllm_engines, "wake_up")
-
-                torch_dist_barrier_and_cuda_sync()
-                self._broadcast_to_vllm()
-
-                if self.strategy.args.vllm_enable_sleep:
-                    batch_vllm_engine_call(self.vllm_engines, "sleep")
-                    torch_dist_barrier_and_cuda_sync()
-
-        # 5. wait remote critic model training done
-        if self.critic_train_remote and not self.strategy.args.colocate_all_models:
-            status.update(ray.get(critic_status_ref))
-        torch_dist_barrier_and_cuda_sync()
-
-        return status
-
-    def ppo_train_actor(self, global_steps):
-        torch.cuda.empty_cache()
+    def ppo_train(self, kl_ctl: float):
         # replay buffer may be empty at first, we should rebuild at each training
         dataloader = DataLoader(
             self.replay_buffer,
@@ -335,37 +168,23 @@ class ActorPPOTrainer(BasePPOTrainer):
             )
             for experience in pbar:
                 experience.to_device(device)
-                status = self.training_step(experience)
+                status = self.training_step(experience, kl_ctl)
+                status["kl"] *= status["response_length"]
+                status = self.strategy.all_reduce(status)
+                status["kl"] /= status["response_length"]
 
-                # for DP
-                # weighted mean for kl
-                if "kl" in status:
-                    status["kl"] *= status["response_length"]
-                    status["entropy"] *= status["response_length"]
-                    status = self.strategy.all_reduce(status)
-                    status["kl"] /= status["response_length"]
-                    status["entropy"] /= status["response_length"]
+                short_status = {
+                    "act_loss": status["policy_loss"],
+                    "reward": status["reward"],
+                    "return": status["return"],
+                    "gen_len": status["response_length"],
+                    "tot_len": status["total_length"],
+                    "kl": status["kl"],
+                    "act_lr": status["actor_lr"],
+                }
 
-                short_status = {}
-
-                if "policy_loss" in status:
-                    short_status = {
-                        "pg": status["policy_loss"],
-                        "rm": status["reward"],
-                        "ret": status["return"],
-                        "glen": status["response_length"],
-                        "tlen": status["total_length"],
-                        "kl": status["kl"],
-                        "act_lr": status["actor_lr"],
-                    }
-
-                if "critic_loss" in status:
-                    short_status["cri"] = status["critic_loss"]
-                    short_status["vals"] = status["values"]
-                    short_status["cri_lr"] = status["critic_lr"]
-
-                if "ptx_loss" in status:
-                    short_status["ptx"] = status["ptx_loss"]
+                if "entropy_loss" in status:
+                    short_status["ent_loss"] = status["entropy_loss"]
 
                 status_list.append(status)
                 pbar.set_postfix(short_status)
@@ -377,10 +196,9 @@ class ActorPPOTrainer(BasePPOTrainer):
                     status_mean[k] += v
             for k in status_mean.keys():
                 status_mean[k] /= len(status_list)
-        torch.cuda.empty_cache()
         return status_mean
 
-    def training_step(self, experience: Experience) -> Dict[str, float]:
+    def training_step(self, experience: Experience, kl_ctl: float) -> Dict[str, float]:
         self.actor.train()
 
         sequences = experience.sequences
@@ -400,7 +218,8 @@ class ActorPPOTrainer(BasePPOTrainer):
             return_output=True,
             ring_attn_group=self.strategy.ring_attn_group,
             packed_seq_lens=packed_seq_lens,
-            visual_inputs=visual_inputs
+            visual_inputs=visual_inputs,
+            return_entropy=self.args.entropy_loss_coef > 1e-8,
         )
 
         # loss function
@@ -415,7 +234,7 @@ class ActorPPOTrainer(BasePPOTrainer):
         
 
         if self.args.use_kl_loss:
-            if self.initial_model is not None:
+            if self.args.init_kl_coef > 0:
                 kl = compute_approx_kl(
                     action_log_probs,
                     base_action_log_probs,
@@ -423,89 +242,31 @@ class ActorPPOTrainer(BasePPOTrainer):
                 )
             else:
                 kl = torch.zeros_like(action_log_probs, dtype=action_log_probs.dtype, device=action_log_probs.device)
-            kl_mean = masked_mean(kl, experience.action_mask, dim=-1)
-
-            kl_loss = kl_mean.mean()
-            experience.info["kl"] = kl_loss.item()
+            kl_loss = masked_mean(kl, experience.action_mask)
+            experience.info["kl"] = kl_loss.detach().item()
         else:
             kl_loss = 0
 
-        # Only apply entropy regularization loss when use_entropy_loss is True
-        if self.use_entropy_loss:
-            entropy_reg_loss = self.entropy_loss(action_log_probs, experience.action_mask)
-        else:
-            entropy_reg_loss = 0
-
+        loss = actor_loss + kl_loss * kl_ctl
         # mixtral
         if self.aux_loss:
-            aux_loss = output.aux_loss
-        else:
-            aux_loss = 0
-            
-        # Add entropy regularization loss to total loss
-        loss = actor_loss + aux_loss * self.args.aux_loss_coef + kl_loss * self.kl_ctl.value
-        if self.use_entropy_loss:
-            loss += entropy_reg_loss
-            
+            loss += output.aux_loss * self.args.aux_loss_coef
+        # entropy loss
+        if self.args.entropy_loss_coef > 1e-8:
+            entropy_loss = masked_mean(output.entropy[:, -experience.action_mask.shape[1] :], experience.action_mask)
+            loss -= entropy_loss * self.args.entropy_loss_coef
+
         self.strategy.backward(loss, self.actor, self.actor_optim)
-
-        # ptx loss
-        if self.pretrain_dataloader is not None:
-            data = next(self.pretrain_dataloader)
-            inputs = data[1].squeeze(1).to(torch.cuda.current_device())
-            attention_mask = data[2].squeeze(1).to(torch.cuda.current_device())
-            label = torch.where(
-                attention_mask.bool(),
-                inputs,
-                self.ptx_loss_fn.IGNORE_INDEX,
-            )
-
-            output = self.actor(inputs, attention_mask=attention_mask, return_output=True)
-            ptx_log_probs = output["logits"]
-
-            # loss function
-            ptx_loss = self.ptx_loss_fn(ptx_log_probs, label)
-            # mixtral
-            if self.aux_loss:
-                aux_loss = output.aux_loss
-            else:
-                aux_loss = 0
-            loss = ptx_loss + aux_loss * self.args.aux_loss_coef
-            self.strategy.backward(self.ptx_coef * loss, self.actor, self.actor_optim)
-
         self.strategy.optimizer_step(self.actor_optim, self.actor, self.actor_scheduler, name="actor")
         if self.ema_model:
             self.strategy.moving_average(self.actor, self.ema_model, self.ema_beta, "cuda")
 
         # status
-        status = {
-            "policy_loss": actor_loss.detach().item(), 
-            "actor_lr": self.actor_scheduler.get_last_lr()[0],
-            "clipped_high_count": clipped_high_count.item(),
-            "clipped_low_count": clipped_low_count.item(),
-            "clipped_high_ratio": (clipped_high_count / experience.info["response_length"]).item(),
-            "clipped_low_ratio": (clipped_low_count / experience.info["response_length"]).item(),
-        }
-        
-        # Only add entropy_reg_loss when we're using entropy regularization
-        if self.use_entropy_loss:
-            status["entropy_reg_loss"] = entropy_reg_loss.item()
-            status["entropy_coef"] = self.entropy_loss.current_coef
-        # entropy value: (Bs, )
-        entropy_value = self.entropy_loss.get_entropy(action_log_probs, experience.action_mask).to(experience.info["response_length"].device)
-        status["entropy"] = (
-            (entropy_value * experience.info["response_length"]).sum() / experience.info["response_length"].sum()
-        ).item()
-
-        if self.pretrain_dataloader is not None:
-            status["ptx_loss"] = ptx_loss.item()
+        status = {"policy_loss": actor_loss.detach().item(), "actor_lr": self.actor_scheduler.get_last_lr()[0]}
+        if self.args.entropy_loss_coef > 1e-8:
+            status["entropy_loss"] = entropy_loss.detach().item()
         for k, v in experience.info.items():
-            if k == "kl":
-                status[k] = (
-                    (v * experience.info["response_length"]).sum() / experience.info["response_length"].sum()
-                ).item()
-            else:
-                status[k] = v.mean().item()
+            status[k] = v.mean().item()
         return status
 
     def _get_leaf_modules(self,model,use_lora):
@@ -636,194 +397,15 @@ class ActorPPOTrainer(BasePPOTrainer):
         torch.cuda.empty_cache()
         torch_dist_barrier_and_cuda_sync()
 
-    def save_logs_and_checkpoints(self, args, global_step, step_bar, logs_dict={}, client_states={}):
-        if global_step % args.logging_steps == 0:
-            # wandb
-            if self._wandb is not None and self.strategy.is_rank_0():
-                logs = {
-                    "train/%s" % k: v
-                    for k, v in {
-                        **logs_dict,
-                        "global_step": global_step,
-                    }.items()
-                }
-                if self.experience_maker.perf_stats is not None:
-                    logs.update({f"perf/experience_maker/{k}": v for k, v in self.experience_maker.perf_stats.items()})
-                self._wandb.log(logs)
-            # TensorBoard
-            if self._tensorboard is not None and self.strategy.is_rank_0():
-                for k, v in logs_dict.items():
-                    self._tensorboard.add_scalar(f"train/{k}", v, global_step)
-                if self.experience_maker.perf_stats is not None:
-                    for k, v in self.experience_maker.perf_stats.items():
-                        self._tensorboard.add_scalar(f"perf/experience_maker/{k}", v, global_step)
-
-        # TODO: Add evaluation mechanism for PPO
-        if global_step % args.eval_steps == 0 and self.eval_dataloader and len(self.eval_dataloader) > 0:
-            self.evaluate(self.eval_dataloader, global_step, args.eval_temperature, args.eval_n_samples_per_prompt)
-        # save ckpt
-        # TODO: save best model on dev, use loss/perplexity/others on whole dev dataset as metric
-        if global_step % args.save_steps == 0:
-            tag = f"global_step{global_step}"
-            self._save_checkpoint(args, tag, client_states)
-
-    def _save_checkpoint(self, args, tag, client_states):
-        # call remote critic
-        if not self.disable_ds_ckpt:
-            if self.critic_train_remote:
-                ref = self.critic.save_checkpoint.remote(tag)
-            self.strategy.save_ckpt(
-                self.actor.model,
-                os.path.join(args.ckpt_path, "_actor"),
-                tag,
-                args.max_ckpt_num,
-                args.max_ckpt_mem,
-                client_states,
-            )
-        if self.save_hf_ckpt:
-            save_path = os.path.join(args.ckpt_path, f"{tag}_hf")
-            self.strategy.save_model(
-                self.ema_model if args.enable_ema else self.actor,
-                self.processor,
-                save_path,
-            )
-        # wait
-        if not self.disable_ds_ckpt:
-            if self.critic_train_remote:
-                ray.get(ref)
-        torch_dist_barrier_and_cuda_sync()
-
-    def evaluate(self, eval_dataloader, global_step, temperature=0.6, n_samples_per_prompt=1):
-        """Evaluate model performance on eval dataset.
-
-        Args:
-            eval_dataloader: DataLoader containing evaluation prompts, labels and data sources
-            global_step: Current training step for logging
-            n_samples_per_prompt: Number of samples to generate per prompt for pass@k calculation
-        """
-        start_time = time.time()
-        if self.strategy.is_rank_0():
-            logger.info(f"⏰ Evaluation start time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-
-        # vLLM wakeup when vllm_enable_sleep
-        if self.strategy.args.vllm_enable_sleep:
-            from openrlhf.trainer.ray.vllm_engine import batch_vllm_engine_call
-
-            batch_vllm_engine_call(self.vllm_engines, "wake_up")
-            torch_dist_barrier_and_cuda_sync()
-
-        # Only run evaluation on ring attention rank0
-        if self.strategy.ring_attn_group is None or self.strategy.ring_attn_rank == 0:
-
-            with torch.no_grad():
-                # First collect all prompts and labels
-                all_prompts = []
-                all_labels = []
-                all_datasources = []
-
-                for datasources, prompts, labels in eval_dataloader:
-                    all_prompts.extend(prompts)
-                    all_labels.extend(labels)
-                    all_datasources.extend(datasources)
-
-                # Generate samples and calculate rewards
-                generate_kwargs = self.generate_kwargs.copy()
-                generate_kwargs["temperature"] = temperature
-                generate_kwargs["n_samples_per_prompt"] = n_samples_per_prompt
-                samples = self.experience_maker.generate_samples(all_prompts, all_labels, **generate_kwargs)
-                queries = [self.tokenizer.batch_decode(seq, skip_special_tokens=False) for seq in samples.sequences]
-
-                # duplicate prompts and labels for each sample
-                all_prompts = sum([[prompt] * n_samples_per_prompt for prompt in all_prompts], [])
-                all_labels = sum([[label] * n_samples_per_prompt for label in all_labels], [])
-
-                # Calculate rewards
-                if self.experience_maker.custom_reward_func:
-                    rewards = self.experience_maker.custom_reward_func.remote(queries, all_prompts, all_labels)
-                else:
-                    rank = torch.distributed.get_rank() // self.strategy.ring_attn_size
-                    rm = self.remote_rm_url[rank % len(self.remote_rm_url)]
-                    rewards = remote_rm_fn_ray.remote(rm, queries=queries, prompts=all_prompts, labels=all_labels)
-                rewards = ray.get(rewards)
-
-                # Reshape rewards to (num_prompts, n_samples_per_prompt)
-                rewards = rewards.reshape(-1, n_samples_per_prompt)
-
-                # Collect local statistics for each data source
-                local_metrics = {}  # {datasource: {"pass{n_samples_per_prompt}": 0, "pass1": 0, "count": 0}}
-
-                for i, datasource in enumerate(all_datasources):
-                    if datasource not in local_metrics:
-                        local_metrics[datasource] = {f"pass{n_samples_per_prompt}": 0, "pass1": 0, "count": 0}
-
-                    # Calculate pass@k and pass@1
-                    prompt_rewards = rewards[i]
-                    local_metrics[datasource][f"pass{n_samples_per_prompt}"] += prompt_rewards.max().float().item()
-                    local_metrics[datasource]["pass1"] += prompt_rewards.mean().float().item()
-                    local_metrics[datasource]["count"] += 1
-
-                # All gather metrics from all ranks
-                gathered_metrics = [None] * (self.strategy.world_size // self.strategy.ring_attn_size)
-                if self.strategy.ring_attn_group is not None:
-                    # Only rank 0 in ring attention group gathers metrics
-                    torch.distributed.all_gather_object(
-                        gathered_metrics, local_metrics, group=self.experience_maker.ring_rank0_group
-                    )
-                else:
-                    torch.distributed.all_gather_object(gathered_metrics, local_metrics)
-
-                # Only rank0 processes the gathered metrics
-                if self.strategy.is_rank_0():
-                    # Combine metrics from all ranks
-                    global_metrics = {}
-                    for rank_metrics in gathered_metrics:
-                        for datasource, metrics in rank_metrics.items():
-                            if datasource not in global_metrics:
-                                global_metrics[datasource] = {f"pass{n_samples_per_prompt}": 0, "pass1": 0, "count": 0}
-                            global_metrics[datasource][f"pass{n_samples_per_prompt}"] += metrics[
-                                f"pass{n_samples_per_prompt}"
-                            ]
-                            global_metrics[datasource]["pass1"] += metrics["pass1"]
-                            global_metrics[datasource]["count"] += metrics["count"]
-
-                    # Calculate global averages
-                    logs = {}
-                    for datasource, metrics in global_metrics.items():
-                        logs[f"eval_{datasource}_pass{n_samples_per_prompt}"] = (
-                            metrics[f"pass{n_samples_per_prompt}"] / metrics["count"]
-                        )
-                        logs[f"eval_{datasource}_pass1"] = metrics["pass1"] / metrics["count"]
-
-                    # Log to wandb/tensorboard
-                    if self._wandb is not None:
-                        logs = {"eval/%s" % k: v for k, v in {**logs, "global_step": global_step}.items()}
-                        self._wandb.log(logs)
-                    elif self._tensorboard is not None:
-                        for k, v in logs.items():
-                            self._tensorboard.add_scalar(f"eval/{k}", v, global_step)
-
-        if self.strategy.args.vllm_enable_sleep:
-            batch_vllm_engine_call(self.vllm_engines, "sleep")
-
-        torch.cuda.empty_cache()
-
-        end_time = time.time()
-        duration = end_time - start_time
-        if self.strategy.is_rank_0():
-            time_str = str(timedelta(seconds=duration)).split(".")[0]
-            logger.info(f"✨ Evaluation completed in {time_str}")
-
-    def reload_states(self):
-        reload_deepspeed_states(self.actor.model)
-
-    def offload_states(self):
-        offload_deepspeed_states(self.actor.model)
-
 
 @ray.remote(num_gpus=1)
 class ActorModelRayActor(BasePPORole):
-    def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain):
+    def init_model_from_pretrained(self, strategy: DeepspeedStrategy, pretrain, max_steps, vllm_engines):
         args = strategy.args
+        self.save_hf_ckpt = args.save_hf_ckpt
+        self.disable_ds_ckpt = args.disable_ds_ckpt
+        self.vllm_engines = vllm_engines
+        self.max_steps = max_steps
 
         if getattr(args, "vllm_num_engines", 0) > 0:
             # To prevent hanging during NCCL synchronization of weights between DeepSpeed and vLLM.
@@ -863,7 +445,7 @@ class ActorModelRayActor(BasePPORole):
         # configure tokenizer
         
         self.data_processor = get_data_processor(
-            pretrain, actor.model, "left", strategy, use_fast=not strategy.args.disable_fast_tokenizer
+            pretrain, "left", strategy, use_fast=not strategy.args.disable_fast_tokenizer
         )
         self.tokenizer = self.data_processor.tokenizer
 
@@ -883,30 +465,6 @@ class ActorModelRayActor(BasePPORole):
         actor_optim = strategy.create_optimizer(
             actor, lr=args.actor_learning_rate, betas=strategy.args.adam_betas, weight_decay=args.l2
         )
-
-        # prepare_datasets
-        self.prepare_datasets()
-
-        # configure scheduler
-        num_update_steps_per_episodes = (
-            len(self.prompts_dataset) * args.n_samples_per_prompt // args.train_batch_size * args.max_epochs
-        )
-        self.num_rollouts_per_episodes = (
-            num_update_steps_per_episodes
-            * args.train_batch_size
-            // args.max_epochs
-            // args.rollout_batch_size
-            // args.n_samples_per_prompt
-        )
-        if args.max_global_steps is None:
-            # If args.max_global_steps is not set, we use num_episodes to calculate max_steps
-            # For dynamic sampling, we need multiple rollouts for one training stage.
-            # In this case, max_steps is not the real training steps of actor model, and you should set args.max_global_steps explicitly.
-            max_steps = math.ceil(args.num_episodes * num_update_steps_per_episodes)
-            args.max_global_steps = args.num_episodes * self.num_rollouts_per_episodes
-        else:
-            max_steps = args.max_global_steps * args.rollout_batch_size * args.n_samples_per_prompt // args.train_batch_size * args.max_epochs
-        self._max_steps = max_steps
 
         actor_scheduler = get_scheduler(
             "cosine_with_min_lr",
@@ -938,179 +496,39 @@ class ActorModelRayActor(BasePPORole):
         self.trained_steps = 0
         ckpt_path = os.path.join(args.ckpt_path, "_actor")
         if args.load_checkpoint and os.path.exists(ckpt_path):
+            strategy.print(f"Loading the checkpoint: {ckpt_path}")
             _, states = strategy.load_ckpt(self.actor.model, ckpt_path)
             self.consumed_samples = states["consumed_samples"]
             self.trained_steps = states["trained_steps"]
-            strategy.print(f"Loaded the checkpoint: {ckpt_path}, consumed_samples: {self.consumed_samples}, trained_steps: {self.trained_steps}")
+            strategy.print(f"consumed_samples: {self.consumed_samples}")
 
         # initial offload
         if strategy.args.deepspeed_enable_sleep:
             offload_deepspeed_states(self.actor.model)
 
-    def prepare_datasets(self):
-        strategy = self.strategy
-        args = self.strategy.args
-
-        # prepare datasets
-        train_data = blending_datasets(
-            args.prompt_data,
-            args.prompt_data_probs,
-            strategy,
-            args.seed,
-            max_count=args.max_samples,
-        )
-
-        # Create train dataset
-        train_data = train_data.select(range(min(args.max_samples, len(train_data))))
-        self.prompts_dataset = PromptDataset(train_data, self.tokenizer, strategy, input_template=args.input_template)
-        self.prompts_dataloader = strategy.setup_dataloader(
-            self.prompts_dataset,
-            args.rollout_batch_size // (strategy.world_size // strategy.ring_attn_size),
-            True,
-            True,
-        )
-
-        # Create eval dataset if eval data exists
-        if getattr(args, "eval_dataset", None):
-            eval_data = blending_datasets(
-                args.eval_dataset,
-                None,  # No probability sampling for eval datasets
-                strategy,
-            )
-            eval_data = eval_data.select(range(min(args.max_samples, len(eval_data))))
-            eval_dataset = PromptDataset(eval_data, self.tokenizer, strategy, input_template=args.input_template)
-            self.eval_dataloader = strategy.setup_dataloader(
-                eval_dataset,
-                1,
-                True,
-                False,
-            )
-        else:
-            self.eval_dataloader = None
-
-        if args.pretrain_data:
-            pretrain_data = blending_datasets(
-                args.pretrain_data,
-                args.pretrain_data_probs,
-                strategy,
-                args.seed,
-            )
-            pretrain_max_len = args.max_len if args.max_len else args.prompt_max_len + args.generate_max_len
-            pretrain_dataset = SFTDataset(
-                pretrain_data.select(
-                    range(
-                        min(
-                            len(pretrain_data), args.max_epochs * len(self.prompts_dataset) * args.n_samples_per_prompt
-                        )
-                    )
-                ),
-                self.tokenizer,
-                pretrain_max_len,
-                strategy,
-                pretrain_mode=True,
-            )
-            self.pretrain_dataloader = itertools.cycle(
-                iter(
-                    strategy.setup_dataloader(
-                        pretrain_dataset,
-                        args.micro_train_batch_size,
-                        True,
-                        True,
-                        pretrain_dataset.collate_fn,
-                    )
-                )
-            )
-        else:
-            self.pretrain_dataloader = None
-
-    def max_steps(self):
-        """Return the maximum number of steps."""
-        return self._max_steps
-
-    def fit(
-        self,
-        critic_model: ray.actor.ActorHandle,
-        initial_model: ray.actor.ActorHandle,
-        reward_model: List[ray.actor.ActorHandle],
-        remote_rm_url: List[str] = None,
-        reward_fn: Callable[[List[torch.Tensor]], torch.Tensor] = None,
-        custom_experience_filter:str=None,
-        vllm_engines: List[ray.actor.ActorHandle] = None,
-        critic_train_remote: bool = False,
-    ):
-        """Train actor model with prompt datasets."""
-        strategy = self.strategy
-        args = self.strategy.args
-
         # configure Trainer
-        trainer = ActorPPOTrainer(
+        self.trainer = ActorPPOTrainer(
             strategy,
             self.actor,
-            critic_model,
-            reward_model,
-            initial_model,
             ema_model=self.ema_model,
-            actor_optim=None,
-            critic_optim=None,
+            actor_optim=self.actor_optim,
             actor_scheduler=self.actor_scheduler,
-            critic_scheduler=None,
-            remote_rm_url=remote_rm_url,
-            reward_fn=reward_fn,
-            custom_experience_filter=custom_experience_filter,
-            vllm_engines=vllm_engines,
-            max_epochs=args.max_epochs,
             micro_train_batch_size=args.micro_train_batch_size,
-            micro_rollout_batch_size=args.micro_rollout_batch_size,
-            gradient_checkpointing=args.gradient_checkpointing,
-            critic_train_remote=critic_train_remote,
             data_processor=self.data_processor,
-            prompt_max_len=args.prompt_max_len,
-            value_clip=args.value_clip,
             eps_clip=args.eps_clip,
-            gamma=args.gamma,
-            lambd=args.lambd,
-            init_kl_coef=args.init_kl_coef,
-            kl_target=args.kl_target,
-            ema_beta=0.992,
-            ptx_coef=args.ptx_coef,
-            max_norm=args.max_norm,
-            # for GPT generation
-            do_sample=True,
-            max_new_tokens=args.generate_max_len,
-            max_length=args.max_len,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            processor_kwargs=args.processor_kwargs,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
-            save_hf_ckpt=args.save_hf_ckpt,
-            disable_ds_ckpt=args.disable_ds_ckpt,
+            ema_beta=args.ema_beta,
+            vllm_engines=self.vllm_engines,
         )
 
-        # broadcast checkpoint
-        ckpt_path = os.path.join(args.ckpt_path, "_actor")
-        if args.load_checkpoint and os.path.exists(ckpt_path) and not vllm_engines is None:
-            # vLLM wakeup when vllm_enable_sleep
-            if self.strategy.args.vllm_enable_sleep:
-                batch_vllm_engine_call(vllm_engines, "wake_up")
-            torch_dist_barrier_and_cuda_sync()
-
-            trainer._broadcast_to_vllm()
-
-            # vLLM offload when vllm_enable_sleep
-            if self.strategy.args.vllm_enable_sleep:
-                batch_vllm_engine_call(vllm_engines, "sleep")
-                torch_dist_barrier_and_cuda_sync()
-
-        trainer.fit(
-            args,
-            self.prompts_dataloader,
-            self.pretrain_dataloader,
-            self.eval_dataloader,
-            self.consumed_samples,
-            self.num_rollouts_per_episodes,
-            self.trained_steps,
-        )
+    def fit(self, kl_ctl: float = 0):
+        """Train actor model with the replay buffer."""
+        torch.cuda.empty_cache()
+        self.actor.train()
+        status = self.trainer.ppo_train(kl_ctl)
+        self.trainer.replay_buffer.clear()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        return status
 
     def save_model(self):
         args = self.strategy.args
@@ -1121,3 +539,60 @@ class ActorModelRayActor(BasePPORole):
             self.data_processor.processor,
             args.save_path,
         )
+
+    def forward(
+        self,
+        sequences: torch.LongTensor,
+        action_mask: Optional[Union[int, list[int]]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        packed_seq_lens=None,
+        visual_inputs: Optional[MMInputs] = None,
+    ) -> torch.Tensor:
+        """Generates actor values."""
+        device = torch.cuda.current_device()
+        self.actor.eval()
+        with torch.no_grad():
+            action_log_probs = self.actor(
+                sequences.to(device),
+                action_mask.to(device),
+                attention_mask.to(device),
+                visual_inputs=visual_inputs.to(device),
+                ring_attn_group=self.strategy.ring_attn_group,
+            )
+        self.actor.train()  # reset model state
+        return action_log_probs.to("cpu")
+
+    def broadcast_to_vllm(self):
+        self.trainer._broadcast_to_vllm()
+
+    def get_attr(self,key:str):
+        return getattr(self,key)
+
+    def append(self, experience: Experience):
+        self.trainer.replay_buffer.append(experience)
+
+    def reload_states(self):
+        reload_deepspeed_states(self.actor.model)
+
+    def offload_states(self):
+        offload_deepspeed_states(self.actor.model)
+
+    def save_checkpoint(self, tag, client_states):
+        args = self.strategy.args
+        self.strategy.save_ckpt(
+            self.actor.model,
+            os.path.join(args.ckpt_path, "_actor"),
+            tag,
+            args.max_ckpt_num,
+            args.max_ckpt_mem,
+            client_states,
+        )
+        if self.save_hf_ckpt:
+            save_path = os.path.join(args.ckpt_path, f"{tag}_hf")
+            self.strategy.save_model(
+                self.ema_model if args.enable_ema else self.actor,
+                self.data_processor.processor,
+                save_path,
+            )
+        # wait
+        torch_dist_barrier_and_cuda_sync()

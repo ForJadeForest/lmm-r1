@@ -9,7 +9,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from openrlhf.utils.logging_utils import init_logger
 
-from .utils import ray_noset_visible_devices
+from .utils import get_bundle_indices, ray_noset_visible_devices
 
 logger = init_logger(__name__)
 
@@ -46,8 +46,6 @@ class LLMRayActor:
             print(f"creating LLM with bundle_indices={bundle_indices}")
 
         # Number of actors that will send prompt to this engine
-        self.num_actors = kwargs.pop("num_actors")
-        self.actor_counter = 0
         self.requests = {}
         self.response_queues = defaultdict(queue.Queue)
 
@@ -86,29 +84,21 @@ class LLMRayActor:
         Save the requests from actors and generate responses when all actors have sent their requests
         """
         self.requests[actor_rank] = vllm_vision_input
-        self.actor_counter += 1
-        if self.actor_counter == self.num_actors:
-            assert len(self.requests) == self.num_actors
-            num_requests = []
-            requests = []
-            for actor_rank, request in self.requests.items():
-                num_requests.append((actor_rank, len(request)))
-                requests.extend(request)
+        num_requests = []
+        requests = []
+        for actor_rank, request in self.requests.items():
+            num_requests.append((actor_rank, len(request)))
+            for r in request:
+                requests.append(r)
 
-            if len(requests) > 0:
-                # For now we assume that all requests have the same sampling params
-                responses = self.llm.generate(requests, sampling_params=sampling_params)
-            else:
-                responses = []
+        responses = self.llm.generate(requests, sampling_params=sampling_params)
+        offset = 0
+        self.responses = {}
+        for actor_rank, num in num_requests:
+            self.response_queues[actor_rank].put(responses[offset : offset + num])
+            offset += num
 
-            offset = 0
-            self.responses = {}
-            for actor_rank, num in num_requests:
-                self.response_queues[actor_rank].put(responses[offset : offset + num])
-                offset += num
-
-            self.actor_counter = 0
-            self.requests = {}
+        self.requests = {}
 
     def get_responses(self, actor_rank):
         """
@@ -126,7 +116,6 @@ def create_vllm_engines(
     enable_prefix_caching: bool,
     enforce_eager: bool,
     max_model_len: int,
-    num_total_actors: int,
     shared_pg=None,
     gpu_memory_utilization=None,
     vllm_enable_sleep=False,
@@ -155,18 +144,13 @@ def create_vllm_engines(
     for i in range(num_engines):
         bundle_indices = None
         if tensor_parallel_size > 1:
-            bundle_indices = list(range(i * tensor_parallel_size, (i + 1) * tensor_parallel_size))
+            bundle_indices = get_bundle_indices(shared_pg, i, tensor_parallel_size)
 
         scheduling_strategy = PlacementGroupSchedulingStrategy(
             placement_group=shared_pg,
             placement_group_capture_child_tasks=True,
-            placement_group_bundle_index=i * tensor_parallel_size,
+            placement_group_bundle_index=bundle_indices[0] if bundle_indices else i,
         )
-
-        if num_engines >= num_total_actors:
-            num_actors = 1
-        else:
-            num_actors = num_total_actors // num_engines + int(i < num_total_actors % num_engines)
 
         vllm_engines.append(
             LLMRayActor.options(
@@ -185,7 +169,6 @@ def create_vllm_engines(
                 dtype="bfloat16",
                 trust_remote_code=True,
                 full_determinism=full_determinism,
-                num_actors=num_actors,
                 gpu_memory_utilization=gpu_memory_utilization,
                 bundle_indices=bundle_indices,
                 num_gpus=0.2 if use_hybrid_engine else 1,
@@ -196,7 +179,7 @@ def create_vllm_engines(
         )
 
     if vllm_enable_sleep:
-        batch_vllm_engine_call(vllm_engines, "sleep", rank_0_only=False)
+        batch_vllm_engine_call(vllm_engines, "sleep")
 
     return vllm_engines
 
@@ -215,8 +198,9 @@ def batch_vllm_engine_call(engines: List[Any], method_name: str, *args, rank_0_o
     """
     import torch
 
-    if rank_0_only and torch.distributed.get_rank() != 0:
-        return None
+    if torch.distributed.is_initialized():
+        if rank_0_only and torch.distributed.get_rank() != 0:
+            return None
 
     refs = []
     for engine in engines:

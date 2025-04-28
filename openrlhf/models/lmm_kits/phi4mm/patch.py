@@ -3,12 +3,12 @@ import torch
 
 class Phi4MMPatch(BasePatch):
     def _register_to_autoclass():
-        from transformers import AutoModel, AutoConfig, AutoProcessor
+        from transformers import AutoModelForImageTextToText, AutoConfig, AutoProcessor
         from .src.configuration_phi4mm import Phi4MMConfig
         from .src.modeling_phi4mm import Phi4MMForCausalLM
         from .src.processing_phi4mm import Phi4MMProcessor
         AutoConfig.register("phi4mm", Phi4MMConfig)
-        AutoModel.register(Phi4MMConfig, Phi4MMForCausalLM)
+        AutoModelForImageTextToText.register(Phi4MMConfig, Phi4MMForCausalLM)
         AutoProcessor.register(Phi4MMConfig, Phi4MMProcessor)
     
     def _add_get_inputs_embeds():
@@ -53,7 +53,7 @@ class Phi4MMPatch(BasePatch):
         torch.nn.MultiheadAttention = HackedMultiheadAttention
                     
     
-    def apply_liger_kernel(self):
+    def apply_liger_kernel():
         from liger_kernel.transformers import LigerPhi3SwiGLUMLP, LigerRMSNorm, liger_rotary_pos_emb
         from .src import modeling_phi4mm
         modeling_phi4mm.Phi4MMMLP = LigerPhi3SwiGLUMLP

@@ -33,7 +33,7 @@ class BasePatch(ABC):
         '''
         return NotImplementedError
     
-    def apply_liger_kernel(self):
+    def apply_liger_kernel():
         '''
         Apply liger kernel to the model.
         '''
