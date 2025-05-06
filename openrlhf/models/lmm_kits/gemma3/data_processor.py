@@ -20,8 +20,8 @@ class Gemma3_VLDataProcessor(BaseDataProcessor):
         messages = self._format_messages(messages)
         processor = self.processor
         batch = processor.apply_chat_template(
-            messages, 
-            add_generation_prompt=True, 
+            messages,
+            add_generation_prompt=True,
             tokenize=True,
             padding=padding,
             max_length=max_length,
@@ -32,7 +32,6 @@ class Gemma3_VLDataProcessor(BaseDataProcessor):
         )
         emb_inputs, extra_info, forward_inputs = self._split_input_dict(batch)
         return MMInputs(emb_inputs=emb_inputs, extra_info=extra_info, forward_inputs=forward_inputs).to(device)
-
 
     def _split_input_dict(self, input_dict: Dict) -> tuple[Dict, Dict]:
         extra_info = {}
@@ -45,13 +44,12 @@ class Gemma3_VLDataProcessor(BaseDataProcessor):
             forward_inputs["token_type_ids"] = input_dict.pop("token_type_ids")
         return input_dict, extra_info, forward_inputs
 
-
     def make_input_batch(self, inputs: List[MMInputs]) -> MMInputs:
         # each element has no batch dimension
         batch = {}
         # collect all keys
         for inp in inputs:
-            batch.update({k:None for k,v in inp.items() if v is not None})
+            batch.update({k: None for k, v in inp.items() if v is not None})
         for k in batch.keys():
             if k in ["input_ids", "attention_mask", "token_type_ids"]:
                 batch[k] = torch.stack([inp[k] for inp in inputs if k in inp], dim=0)
@@ -59,10 +57,9 @@ class Gemma3_VLDataProcessor(BaseDataProcessor):
                 # concat all patches of all images in a batch in the first dimension
                 batch[k] = torch.cat([inp[k] for inp in inputs if k in inp], dim=0)
             else:
-                raise ValueError(f"Unknown key {k} for Qwen2VLDataProcessor")
+                raise ValueError(f"Unknown key {k} for Gemma3_VLDataProcessor")
         emb_inputs, extra_info, forward_inputs = self._split_input_dict(batch)
         return MMInputs(emb_inputs=emb_inputs, extra_info=extra_info, forward_inputs=forward_inputs)
-
 
     def split_input_batch(self, batch: MMInputs) -> List[MMInputs]:
         batch_size = len(batch["input_ids"])
@@ -77,9 +74,7 @@ class Gemma3_VLDataProcessor(BaseDataProcessor):
                     batch_kwargs[i][k] = None
 
         if "pixel_values" in keys and ("input_ids" not in keys):
-            raise ValueError(
-                "Cannot split batch with pixel_values without input_ids"
-            )
+            raise ValueError("Cannot split batch with pixel_values without input_ids")
 
         for k in ["input_ids", "attention_mask", "token_type_ids"]:
             if k in keys:
@@ -97,7 +92,6 @@ class Gemma3_VLDataProcessor(BaseDataProcessor):
                 img_num = (token_type_ids_i == 1).sum().item() // 256
                 if img_num == 0:
                     batch_kwargs[i]["pixel_values"] = None
-                    batch_kwargs[i]["image_grid_thw"] = None
                     continue
 
                 pixel_values_i = pixel_values[:img_num]
@@ -108,9 +102,10 @@ class Gemma3_VLDataProcessor(BaseDataProcessor):
         mm_inputs_list = []
         for b in batch_kwargs:
             emb_inputs, extra_info, forward_inputs = self._split_input_dict(b)
-            mm_inputs_list.append(MMInputs(emb_inputs=emb_inputs,extra_info=extra_info, forward_inputs=forward_inputs))
+            mm_inputs_list.append(
+                MMInputs(emb_inputs=emb_inputs, extra_info=extra_info, forward_inputs=forward_inputs)
+            )
         return mm_inputs_list
-
 
     def warp_str_content_to_dict(self, messages_list: List[List[Dict]]):
         """
@@ -118,28 +113,16 @@ class Gemma3_VLDataProcessor(BaseDataProcessor):
         """
         for messages in messages_list:
             for message in messages:
-                if isinstance(message['content'], str):
-                    message['content'] = [{
-                        "type": "text",
-                        "text": message['content']
-                    }]
+                if isinstance(message["content"], str):
+                    message["content"] = [{"type": "text", "text": message["content"]}]
                 else:
-                    assert isinstance(message['content'], list)
+                    assert isinstance(message["content"], list)
         return messages_list
-    
+
     def _format_messages(self, messages: Union[Dict, List[str], str]) -> List[List[Dict]]:
-        from copy import deepcopy
-        messages = deepcopy(messages)
-        if isinstance(messages, list) and isinstance(messages[0], str):
-            formated_messages = [json.loads(m) for m in messages]
-        elif isinstance(messages, str):
-            formated_messages = [json.loads(messages)]
-        elif isinstance(messages, dict):
-            formated_messages = [[messages]]
-        else:
-            raise ValueError("Invalid messages format, must be a list of strings or a string or a dict")
+        formated_messages = super()._format_messages(messages)
         formated_messages = self.warp_str_content_to_dict(formated_messages)
-        
+
         return formated_messages
 
 

@@ -5,13 +5,13 @@ import torch
 import torch.nn as nn
 from peft import LoraConfig, get_peft_model
 from peft.tuners.lora import LoraLayer
-from transformers import BitsAndBytesConfig
+from transformers import BitsAndBytesConfig, AutoConfig
 from transformers.integrations.deepspeed import HfDeepSpeedConfig
 
 from openrlhf.utils.logging_utils import init_logger
 
 from .ring_attn_utils import set_hacked_position_ids, clear_hacked_position_ids
-from openrlhf.models.lmm_kits.utils import get_generation_cls, smart_load_config
+from openrlhf.models.lmm_kits.utils import get_generation_cls
 from openrlhf.models.lmm_kits.base.data_processor import MMInputs
 from .ring_attn_utils import gather_and_pad_tensor, unpad_and_slice_tensor
 
@@ -69,15 +69,17 @@ def get_llm_for_sequence_regression(
         model_type == "critic" or model_type == "reward"
     ), f"invalid model_type: {model_type}, should be critic or reward."
 
-    config = smart_load_config(model_name_or_path)
+    base_class = get_generation_cls(model_name_or_path)
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+    from transformers.configuration_utils import PretrainedConfig
+    base_model_type = PretrainedConfig.from_pretrained(model_name_or_path).model_type
+    config = AutoConfig.from_pretrained(model_name_or_path,trust_remote_code= base_model_type not in CONFIG_MAPPING)
     config.normalize_reward = normalize_reward
     config._attn_implementation = "flash_attention_2" if use_flash_attention_2 else "eager"
 
     # Prioritize using the value_head_prefix in the model configuration.
     value_head_prefix = getattr(config, "value_head_prefix", value_head_prefix)
     logger.info(f"set value_head_prefix to `{value_head_prefix}`")
-    base_class = get_generation_cls(config)
-    base_pretrained_class = base_class.__base__
     if model_type == "reward":
         cls_class = _get_reward_model(base_class, value_head_prefix, packing_samples)
     else:

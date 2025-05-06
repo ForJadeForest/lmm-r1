@@ -1,32 +1,71 @@
 import math
 import os
+from abc import ABC
 from typing import Dict, Optional, Union
 
 import ray
 import torch
+from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers.trainer import get_scheduler
 
-from openrlhf.models import get_llm_for_sequence_regression
+from openrlhf.models import ValueLoss, get_llm_for_sequence_regression
 from openrlhf.models.utils import masked_mean
-from openrlhf.trainer import BasePPOTrainer
-from openrlhf.trainer.ppo_utils import Experience
+from openrlhf.trainer.ppo_utils.experience_maker import Experience
 from openrlhf.models.lmm_kits.utils import get_data_processor
 from openrlhf.models.lmm_kits.base.data_processor import MMInputs
 from openrlhf.utils.deepspeed import DeepspeedStrategy
 from openrlhf.utils.deepspeed.deepspeed_utils import offload_deepspeed_states, reload_deepspeed_states
 
+from ..ppo_utils import NaiveReplayBuffer
 from .launcher import BasePPORole
 
 
-class CriticPPOTrainer(BasePPOTrainer):
+class CriticPPOTrainer(ABC):
+    def __init__(
+        self,
+        strategy,
+        critic: torch.nn.Module,
+        critic_optim: Optimizer,
+        critic_scheduler,
+        micro_train_batch_size: int = 8,
+        buffer_limit: int = 0,
+        buffer_cpu_offload: bool = True,
+        value_clip: float = 0.2,
+        data_processor=None,
+        dataloader_pin_memory: bool = True,
+        **kwargs,
+    ):
+        self.strategy = strategy
+        self.args = strategy.args
+        self.critic = critic
+        self.critic_optim = critic_optim
+        self.critic_scheduler = critic_scheduler
+        self.micro_train_batch_size = micro_train_batch_size
+        self.buffer_limit = buffer_limit
+        self.buffer_cpu_offload = buffer_cpu_offload
+        self.value_clip = value_clip
+        self.dataloader_pin_memory = dataloader_pin_memory
+        self.data_processor = data_processor
+        self.tokenizer = data_processor.tokenizer
+        self.max_epochs = self.args.max_epochs
+
+        self.replay_buffer = NaiveReplayBuffer(
+            micro_train_batch_size, data_processor, buffer_limit, buffer_cpu_offload, getattr(self.args, "packing_samples", False), False
+        ) # Dynamic sampling is controlled by the single controller. We don't need to store extra buffers here.
+
+        self.critic_loss_fn = ValueLoss(value_clip)
+
+        # Mixtral 8x7b
+        self.aux_loss = self.args.aux_loss_coef > 1e-8
+
     def ppo_train(self):
         # replay buffer may be empty at first, we should rebuild at each training
         dataloader = DataLoader(
             self.replay_buffer,
             batch_size=self.replay_buffer.sample_batch_size,
-            shuffle=True,
+            shuffle=False if self.strategy.ring_attn_group is not None else True,
             drop_last=True,
             pin_memory=self.dataloader_pin_memory,
             collate_fn=self.replay_buffer.collate_fn,
@@ -102,7 +141,7 @@ class CriticPPOTrainer(BasePPOTrainer):
         # status
         status = {
             "critic_loss": critic_loss.detach().item(),
-            "values": masked_mean(values, experience.action_mask).item(),
+            "values": masked_mean(values, experience.action_mask).detach().item(),
             "critic_lr": self.critic_scheduler.get_last_lr()[0],
         }
         return status
@@ -163,8 +202,8 @@ class CriticModelRayActor(BasePPORole):
         # load checkpoint
         if args.load_checkpoint and os.path.exists(os.path.join(args.ckpt_path, "_actor")):
             ckpt_path = os.path.join(args.ckpt_path, "_critic")
+            strategy.print(f"Loading the checkpoint: {ckpt_path}")
             strategy.load_ckpt(self.critic, ckpt_path)
-            strategy.print(f"Loaded the checkpoint: {ckpt_path}")
 
         # initial offload
         if strategy.args.deepspeed_enable_sleep:
@@ -172,27 +211,16 @@ class CriticModelRayActor(BasePPORole):
 
         # configure Trainer
         self.data_processor = get_data_processor(
-            pretrain, self.critic, "left", strategy, use_fast=not strategy.args.disable_fast_tokenizer
+            pretrain, "left", strategy, use_fast=not strategy.args.disable_fast_tokenizer
         )
         self.trainer = CriticPPOTrainer(
             strategy,
-            actor=None,
             critic=self.critic,
-            reward_model=None,
-            initial_model=None,
-            ema_model=None,
-            actor_optim=None,
             critic_optim=self.critic_optim,
-            actor_scheduler=None,
             critic_scheduler=self.critic_scheduler,
-            max_epochs=args.max_epochs,
             micro_train_batch_size=args.micro_train_batch_size,
-            micro_rollout_batch_size=args.micro_rollout_batch_size,
-            gradient_checkpointing=args.gradient_checkpointing,
-            prompt_max_len=args.prompt_max_len,
             value_clip=args.value_clip,
-            eps_clip=args.eps_clip,
-            data_processor=self.data_processor
+            data_processor=self.data_processor,
         )
 
     def forward(
@@ -213,8 +241,7 @@ class CriticModelRayActor(BasePPORole):
                 attention_mask.to(device),
                 ring_attn_group=self.strategy.ring_attn_group,
                 values_allgather=True,
-                packed_seq_lens=packed_seq_lens,
-                visual_inputs=visual_inputs.to(device),
+                visual_inputs=visual_inputs.to(device)
             )
         self.critic.train()  # reset model state
         return value.to("cpu")
@@ -230,11 +257,8 @@ class CriticModelRayActor(BasePPORole):
         status = self.trainer.ppo_train()
         self.trainer.replay_buffer.clear()
         torch.cuda.empty_cache()
-        return status
-
-    def empty_cache(self) -> None:
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        return status
 
     def save_model(self):
         args = self.strategy.args

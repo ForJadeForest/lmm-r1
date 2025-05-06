@@ -11,6 +11,7 @@ def get_train_ds_config(
     grad_accum_dtype=None,
     overlap_comm=False,
     use_ds_universal_ckpt=False,
+    deepcompile=False,
 ):
     device = "cpu" if offload else "none"
     zero_opt_dict = {
@@ -50,6 +51,9 @@ def get_train_ds_config(
         "checkpoint": {
             "load_universal": use_ds_universal_ckpt,
         },
+        "compile": {
+            "deepcompile": deepcompile,
+        },
     }
 
 
@@ -57,7 +61,12 @@ def get_eval_ds_config(
     offload,
     stage=0,
     bf16=True,
+    deepcompile=False,
 ):
+    # At least for 0.16.6, DeepCompile hasn't support pure inference mode
+    # https://github.com/deepspeedai/DeepSpeed/pull/7225
+    deepcompile = False
+
     zero_opt_dict = {
         "stage": stage,
         "stage3_max_live_parameters": "auto",
@@ -78,6 +87,9 @@ def get_eval_ds_config(
         "gradient_clipping": 1.0,
         "prescale_gradients": False,
         "wall_clock_breakdown": False,
+        "compile": {
+            "deepcompile": deepcompile,
+        },
     }
 
 

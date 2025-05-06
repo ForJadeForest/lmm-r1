@@ -11,7 +11,8 @@ def get_tokenizer(pretrain, model, padding_side="left", strategy=None, use_fast=
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
-        model.config.pad_token_id = tokenizer.pad_token_id
+        if model is not None:
+            model.config.pad_token_id = tokenizer.pad_token_id
 
     return tokenizer
 
@@ -73,7 +74,7 @@ def blending_datasets(
             data = load_dataset(dataset, trust_remote_code=True)
             strategy.print(f"loaded {dataset} with python script")
         # local text file
-        elif ext in [".json", ".jsonl", ".csv", ".parquet"]:
+        elif ext in [".json", ".jsonl", ".csv", ".parquet", ".arrow"]:
             ext = ext.lower().strip(".")
             if ext == "jsonl":
                 ext = "json"

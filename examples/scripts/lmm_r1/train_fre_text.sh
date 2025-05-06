@@ -101,6 +101,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    --init_kl_coef 0.001 \
    --prompt_data ${DATASET_PATH} \
    --input_key message \
+   --label_key "answer" \
    --normalize_reward \
    --flash_attn \
    --lambd 1 \
