@@ -39,8 +39,6 @@
 
 - [2025/2/13] We release code of LMM-R1!
 
-## Recently Update
-- [2025/4/7] ⚙️ Implemented warm-up style entropy coefficient scheduling, enabling higher exploration in early training and focusing on exploitation later
 
 ## Introduction
 
