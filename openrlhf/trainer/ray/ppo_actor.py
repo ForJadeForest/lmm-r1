@@ -223,15 +223,12 @@ class ActorPPOTrainer(ABC):
         )
 
         # loss function
-        actor_loss_results = self.actor_loss_fn(
+        actor_loss = self.actor_loss_fn(
             action_log_probs,
             old_action_log_probs,
             advantages,
             action_mask=experience.action_mask,
         )
-        # Unpack the return values
-        actor_loss, clipped_high_count, clipped_low_count = actor_loss_results
-        
 
         if self.args.use_kl_loss:
             if self.args.init_kl_coef > 0:

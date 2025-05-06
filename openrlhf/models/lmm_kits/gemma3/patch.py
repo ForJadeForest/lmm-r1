@@ -45,6 +45,7 @@ class Gemma3_Patch(BasePatch):
 
     def _add_get_position_ids():
         from transformers import Gemma3ForConditionalGeneration
+
         def get_position_ids(self, input_ids, attention_mask=None, **kwargs):
             if attention_mask is None:
                 attention_mask = torch.ones_like(input_ids)
