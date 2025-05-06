@@ -93,19 +93,19 @@ class PolicyLoss(nn.Module):
         surr1 = ratio * advantages
         surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps) * advantages
         loss = -torch.min(surr1, surr2)
-        
+
         # Calculate which samples were clipped
         clipped_high = (ratio > 1 + self.clip_eps).float()
         clipped_low = (ratio < 1 - self.clip_eps).float()
-        
+
         if action_mask is not None:
             # Mask samples for accurate counting
             clipped_high = clipped_high * action_mask
             clipped_low = clipped_low * action_mask
-            
+
         clipped_high_count = clipped_high.sum(dim=-1)
         clipped_low_count = clipped_low.sum(dim=-1)
-        
+
         # Original loss calculation
         loss = (
             masked_mean(loss, action_mask, dim=None)
@@ -325,120 +325,6 @@ class KDLoss(nn.Module):
         distil_loss = -torch.sum(x * mask.view(-1), dim=0) / torch.sum(mask.view(-1), dim=0)
 
         return distil_loss
-
-
-class EntropyRegularizationLoss(nn.Module):
-    """
-    Entropy Regularization Loss for PPO
-    
-    This loss encourages exploration early in training by maximizing action entropy,
-    and gradually decreases its effect over time to encourage exploitation later.
-    """
-    
-    def __init__(
-        self, 
-        initial_coef: float = 0.01, 
-        decay_rate: float = 0.9,
-        decay_strategy: str = "exponential",
-        regularization_ratio: float = 0.1
-    ) -> None:
-        """
-        Initialize entropy regularization loss
-        
-        Args:
-            initial_coef: Initial entropy coefficient
-            decay_rate: Coefficient decay rate
-            decay_strategy: Decay strategy ("linear", "exponential", "cosine")
-            regularization_ratio: Ratio of training steps to use for entropy regularization (0.0 to 1.0)
-        """
-        super().__init__()
-        self.initial_coef = initial_coef
-        self.decay_rate = decay_rate
-        self.decay_strategy = decay_strategy
-        self.regularization_ratio = regularization_ratio
-        self.current_coef = initial_coef
-        
-    def update_coef(self, progress: float) -> None:
-        """
-        Update entropy coefficient based on training progress
-        
-        Args:
-            progress: Training progress (0.0 to 1.0)
-        """
-        # If coefficient has been set to 0, skip update. 
-        if self.current_coef == 0.0:
-            return
-        # Only use entropy regularization during the regularization period
-        if progress >= self.regularization_ratio:
-            self.current_coef = 0.0
-            return
-            
-        # Normalize progress to be relative to regularization period
-        normalized_progress = progress / self.regularization_ratio
-        
-        if self.decay_strategy == "linear":
-            # Linear decay from initial_coef to 0
-            self.current_coef = self.initial_coef * (1 - normalized_progress)
-        elif self.decay_strategy == "cosine":
-            # Cosine decay from initial_coef to 0
-            import math
-            self.current_coef = self.initial_coef * 0.5 * (1 + math.cos(normalized_progress * math.pi))
-        else:
-            # Exponential decay from initial_coef to near 0
-            decay_factor = self.decay_rate ** normalized_progress
-            self.current_coef = self.initial_coef * decay_factor
-        
-    def forward(
-        self,
-        action_log_probs: torch.Tensor,
-        action_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Compute entropy regularization loss
-        
-        Args:
-            action_log_probs: Log probabilities of actions
-            action_mask: Mask for valid actions
-            
-        Returns:
-            Entropy loss (negative entropy multiplied by coefficient)
-        """
-        # If coefficient is 0, return 0 loss directly
-        if self.current_coef == 0.0:
-            return torch.tensor(0.0, device=action_log_probs.device)
-            
-        # Compute entropy: H = -Σ p * log(p)
-        probs = action_log_probs.exp()
-        entropy = -(probs * action_log_probs)
-        
-        if action_mask is not None:
-            entropy = masked_mean(entropy, action_mask, dim=-1)
-        else:
-            entropy = entropy.mean(dim=-1)
-            
-        entropy = entropy.mean()
-        
-        # Return negative entropy (since we're minimizing)
-        return -self.current_coef * entropy
-    
-    @torch.no_grad()
-    def get_entropy(
-        self,
-        action_log_probs: torch.Tensor,
-        action_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Compute entropy value without coefficient for logging
-        """
-        probs = action_log_probs.exp()
-        entropy = -(probs * action_log_probs)
-        
-        if action_mask is not None:
-            entropy = masked_mean(entropy, action_mask, dim=-1)
-        else:
-            entropy = entropy.mean(dim=-1)
-
-        return entropy
 
 
 class PRMLoss(nn.Module):
