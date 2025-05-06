@@ -105,7 +105,17 @@ def get_reward():
 
         do_print = random.randint(1, 20) == 1
         if do_print:
-            info = f"Query: {q}\n\nProblem: {problem}\n\n Answer: {answer}\n\n Response: {response}\n\n Format Reward: {format_reward}\n\n Acc Reward: {acc_reward_future.result()}\n\n"
+            info = (
+                "\n" + "="*80 + "\n"
+                f"[Query]:\n{q}\n\n"
+                f"[Problem]:\n{problem}\n\n"
+                f"[Ground Truth Answer]:\n{answer}\n\n"
+                f"[Model Response]:\n{response}\n\n"
+                f"[Rewards]:\n"
+                f"  • Format Score: {format_reward:.2f}\n"
+                f"  • Accuracy Score: {acc_reward_future.result():.2f}\n"
+                "="*80 + "\n"
+            )
             info = re.sub(r"<\|.*?\|>|<pad>", "", info)
             logger.info(info)
 
